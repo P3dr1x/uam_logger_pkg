@@ -21,7 +21,6 @@ from rclpy.node import Node
 from geometry_msgs.msg import Accel, Pose, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Float64MultiArray
 
 
 try:
@@ -93,6 +92,9 @@ class UamLoggerNode(Node):
 		self.declare_parameter("output_dir", os.path.expanduser("~/.ros/uam_logger"))
 		self.declare_parameter("reference_timeout_sec", 0.5)
 		self.declare_parameter("watchdog_period_sec", 0.05)
+		# Downsampling: log 1 sample every N messages (per topic)
+		# Example: 5 -> keep 1 out of 5
+		self.declare_parameter("log_every_n", 5)
 
 		# Topics (overrideable)
 		self.declare_parameter("topic_desired_ee_accel", "/desired_ee_accel")
@@ -102,7 +104,6 @@ class UamLoggerNode(Node):
 		self.declare_parameter("topic_odometry", "/model/t960a_0/odometry")
 		self.declare_parameter("topic_ee_pose", "/ee_world_pose")
 		self.declare_parameter("topic_joint_states", "/joint_states")
-		self.declare_parameter("topic_arm_commands", "/arm_controller/commands")
 		self.declare_parameter("topic_sensor_combined", "/fmu/out/sensor_combined")
 
 		self.experiment_name: str = self.get_parameter("experiment_name").value
@@ -110,6 +111,9 @@ class UamLoggerNode(Node):
 		self.output_dir = Path(str(self.get_parameter("output_dir").value)).expanduser()
 		self.reference_timeout_sec: float = float(self.get_parameter("reference_timeout_sec").value)
 		watchdog_period_sec: float = float(self.get_parameter("watchdog_period_sec").value)
+		self.log_every_n: int = int(self.get_parameter("log_every_n").value)
+		if self.log_every_n < 1:
+			self.log_every_n = 1
 
 		self.topic_desired_ee_accel: str = self.get_parameter("topic_desired_ee_accel").value
 		self.topic_desired_ee_vel: str = self.get_parameter("topic_desired_ee_vel").value
@@ -118,7 +122,6 @@ class UamLoggerNode(Node):
 		self.topic_odometry: str = self.get_parameter("topic_odometry").value
 		self.topic_ee_pose: str = self.get_parameter("topic_ee_pose").value
 		self.topic_joint_states: str = self.get_parameter("topic_joint_states").value
-		self.topic_arm_commands: str = self.get_parameter("topic_arm_commands").value
 		self.topic_sensor_combined: str = self.get_parameter("topic_sensor_combined").value
 
 		self.state: LoggerState = LoggerState.IDLE
@@ -127,6 +130,7 @@ class UamLoggerNode(Node):
 		self._t_trigger_start_ns: Optional[int] = None
 		self._t_first_desired_vel_ns: Optional[int] = None
 		self._last_reference_ns: Optional[int] = None
+		self._topic_msg_counts: Dict[str, int] = {}
 
 		# Trigger subscriptions
 		self.create_subscription(Accel, self.topic_desired_ee_accel, self._desired_accel_cb, 10)
@@ -137,7 +141,6 @@ class UamLoggerNode(Node):
 		self.create_subscription(Odometry, self.topic_odometry, self._odometry_cb, 10)
 		self.create_subscription(Pose, self.topic_ee_pose, self._ee_pose_cb, 10)
 		self.create_subscription(JointState, self.topic_joint_states, self._joint_states_cb, 10)
-		self.create_subscription(Float64MultiArray, self.topic_arm_commands, self._arm_commands_cb, 10)
 
 		if HAVE_PX4_MSGS:
 			self.create_subscription(  # type: ignore[arg-type]
@@ -171,6 +174,7 @@ class UamLoggerNode(Node):
 		self._t_trigger_start_ns = now_ns
 		self._t_first_desired_vel_ns = None
 		self._last_reference_ns = now_ns
+		self._topic_msg_counts = {}
 
 		self.get_logger().info(
 			f"START RECORDING (trigger={reference_topic}, t_trigger_start_ns={now_ns})"
@@ -184,6 +188,12 @@ class UamLoggerNode(Node):
 		self._last_reference_ns = now_ns
 
 	def _append(self, topic: str, t_ns: int, fields: Dict[str, Any]) -> None:
+		# Downsampling: keep 1 sample every N messages (per topic).
+		count = self._topic_msg_counts.get(topic, 0)
+		keep = (count == 0) or (self.log_every_n == 1) or (count % self.log_every_n == 0)
+		self._topic_msg_counts[topic] = count + 1
+		if not keep:
+			return
 		self._rows.append(LogRow(t_ns=t_ns, topic=topic, fields=fields))
 
 	# ---------------------------- Trigger callbacks ----------------------------
@@ -314,26 +324,6 @@ class UamLoggerNode(Node):
 			},
 		)
 
-	def _arm_commands_cb(self, msg: Float64MultiArray) -> None:
-		if self.state != LoggerState.RECORDING:
-			return
-		t_ns = self._now_ns()
-		layout_dim = []
-		try:
-			for d in msg.layout.dim:
-				layout_dim.append(f"{d.label}:{d.size}:{d.stride}")
-		except Exception:
-			layout_dim = []
-		self._append(
-			topic=self.topic_arm_commands,
-			t_ns=t_ns,
-			fields={
-				"data": _join_seq(msg.data),
-				"layout_dim": _join_seq(layout_dim),
-				"layout_data_offset": int(getattr(msg.layout, "data_offset", 0)),
-			},
-		)
-
 	def _sensor_combined_cb(self, msg: Any) -> None:
 		if self.state != LoggerState.RECORDING:
 			return
@@ -387,6 +377,7 @@ class UamLoggerNode(Node):
 		self._t_trigger_start_ns = None
 		self._t_first_desired_vel_ns = None
 		self._last_reference_ns = None
+		self._topic_msg_counts = {}
 		self.get_logger().info("IDLE")
 
 	def _select_time_zero_ns(self) -> Optional[int]:
@@ -440,7 +431,19 @@ def main(args: Optional[Sequence[str]] = None) -> None:
 	node = UamLoggerNode()
 	try:
 		rclpy.spin(node)
+	except KeyboardInterrupt:
+		# Normal shutdown path when user presses Ctrl+C.
+		pass
 	finally:
-		node.destroy_node()
-		rclpy.shutdown()
+		try:
+			node.destroy_node()
+		except Exception:
+			pass
+
+		# Under ros2 launch the context may already be shutdown.
+		try:
+			if rclpy.ok():
+				rclpy.shutdown()
+		except Exception:
+			pass
 

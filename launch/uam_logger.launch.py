@@ -12,6 +12,11 @@ def generate_launch_description() -> LaunchDescription:
 		default_value="experiment",
 		description="Prefix used for the output CSV filename.",
 	)
+	log_every_n_arg = DeclareLaunchArgument(
+		"log_every_n",
+		default_value="5",
+		description="Downsampling: log 1 sample every N messages (per topic).",
+	)
 	output_dir_arg = DeclareLaunchArgument(
 		"output_dir",
 		default_value="~/.ros/uam_logger",
@@ -31,6 +36,7 @@ def generate_launch_description() -> LaunchDescription:
 		parameters=[
 			{"use_sim_time": True},
 			{"experiment_name": LaunchConfiguration("experiment_name")},
+			{"log_every_n": LaunchConfiguration("log_every_n")},
 			{"output_dir": LaunchConfiguration("output_dir")},
 			{"reference_timeout_sec": LaunchConfiguration("reference_timeout_sec")},
 		],
@@ -38,6 +44,7 @@ def generate_launch_description() -> LaunchDescription:
 
 	return LaunchDescription([
 		experiment_name_arg,
+		log_every_n_arg,
 		output_dir_arg,
 		reference_timeout_arg,
 		node,
