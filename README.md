@@ -23,7 +23,6 @@ Logged data topics (during RECORDING):
 - `/model/t960a_0/odometry` (`nav_msgs/msg/Odometry`): x,y,z, roll,pitch,yaw and twist (linear/angular velocity)
 - `/ee_world_pose` (`geometry_msgs/msg/Pose`): all pose fields
 - `/joint_states` (`sensor_msgs/msg/JointState`): all fields
-- `/arm_controller/commands` (`std_msgs/msg/Float64MultiArray`): all fields
 - `/fmu/out/sensor_combined` (`px4_msgs/msg/SensorCombined`) if available: accelerometer linear acceleration
 
 ## Time handling (alignment)
@@ -71,6 +70,7 @@ Launch (recommended, enables sim time by default):
 ```bash
 ros2 launch uam_logger_pkg uam_logger.launch.py \
   experiment_name:=sitl_test \
+	log_every_n:=5 \
   reference_timeout_sec:=0.5
 ```
 
@@ -85,15 +85,32 @@ ros2 run uam_logger_pkg uam_logger_node --ros-args -p use_sim_time:=true
 Common parameters:
 
 - `experiment_name` (string): filename prefix
+- `log_every_n` (int): downsampling factor (log 1 sample every N messages, per topic)
 - `output_dir` (string): directory where CSV files are written (default: `~/.ros/uam_logger`)
 - `reference_timeout_sec` (float): stop condition timeout
 
 Topic remapping via parameters (advanced):
 
 - `topic_desired_ee_accel`, `topic_desired_ee_vel`, `topic_desired_ee_pose`
-- `topic_odometry`, `topic_ee_pose`, `topic_joint_states`, `topic_arm_commands`, `topic_sensor_combined`
+- `topic_odometry`, `topic_ee_pose`, `topic_joint_states`, `topic_sensor_combined`
 
-## Notes
+> [!NOTE]
+> - For SITL, keep `use_sim_time=true` so timestamps follow the simulator clock.
+>- `px4_msgs` might not be available in every environment; in that case the node will warn and skip `/fmu/out/sensor_combined`.
 
-- For SITL, keep `use_sim_time=true` so timestamps follow the simulator clock.
-- `px4_msgs` might not be available in every environment; in that case the node will warn and skip `/fmu/out/sensor_combined`.
+## Offline plotting
+
+You can generate plots from a saved CSV using:
+
+```bash
+ros2 run uam_logger_pkg uam_logger_offline_plot -- --csv ~/.ros/uam_logger/<your_file>.csv
+```
+
+Optional: save the figures to PNG files without opening a window:
+
+```bash
+ros2 run uam_logger_pkg uam_logger_offline_plot -- \
+  --csv ~/.ros/uam_logger/<your_file>.csv \
+  --save-dir ~/.ros/uam_logger/plots \
+  --no-show
+```

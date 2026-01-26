@@ -25,6 +25,7 @@ setup(
 	entry_points={
 		"console_scripts": [
 			"uam_logger_node = uam_logger_pkg.uam_logger_node:main",
+			"uam_logger_offline_plot = uam_logger_pkg.offline_plotting:main",
 		],
 	},
 )
