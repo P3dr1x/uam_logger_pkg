@@ -3,7 +3,7 @@
 This script loads the CSV produced by `uam_logger_node` and generates plots for:
 - Desired vs real end-effector 3D trajectory
 - Pose tracking error norm over time (nearest-timestamp matching)
-- Drone position and attitude (3x2 grid)
+- Drone position and attitude (3x2 grid) (odometry in sim, mocap pose in real)
 - Drone RMS attitude disturbance (RMS of roll/pitch/yaw)
 - Drone displacement norms w.r.t. initial pose
 - PX4 SensorCombined accelerometer + gyroscope data (if present)
@@ -812,23 +812,7 @@ def _plot_real_t960a_twist(twist: TwistSeries, title_prefix: str) -> None:
 	axs[2, 1].set_xlabel("t [s]")
 	for i in range(3):
 		axs[i, 1].grid(True)
-		return
-
-	if gyro is not None:
-		fig, axs = plt.subplots(3, 1, sharex=True)
-		fig.suptitle(f"{title_prefix} - SensorCombined gyroscope")
-		gx_deg_s = [_rad_to_deg(w) for w in gyro.gx]
-		gy_deg_s = [_rad_to_deg(w) for w in gyro.gy]
-		gz_deg_s = [_rad_to_deg(w) for w in gyro.gz]
-		axs[0].plot(gyro.t, gx_deg_s)
-		axs[1].plot(gyro.t, gy_deg_s)
-		axs[2].plot(gyro.t, gz_deg_s)
-		axs[0].set_ylabel("ωx [°/s]")
-		axs[1].set_ylabel("ωy [°/s]")
-		axs[2].set_ylabel("ωz [°/s]")
-		axs[2].set_xlabel("t [s]")
-		for ax in axs:
-			ax.grid(True)
+	return
 
 
 def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
@@ -852,27 +836,33 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	topic_desired_pose = "/desired_ee_global_pose"
 	topic_real_pose = "/ee_world_pose"
 	topic_odom = "/model/t960a_0/odometry"
+	topic_mocap_pose = "/t960a/pose"
 	topic_sensor = "/fmu/out/sensor_combined"
 	topic_real_twist = "/real_t960a_twist"
 
 	desired_pose = _extract_pose_series(groups.get(topic_desired_pose, []))
 	real_pose = _extract_pose_series(groups.get(topic_real_pose, []))
-	odom = _extract_odom_series(groups.get(topic_odom, []))
+	# Base-drone pose source:
+	# - Real: motion capture PoseStamped on /t960a/pose (logged by uam_logger_node)
+	# - Sim: Gazebo odometry on /model/t960a_0/odometry
+	base_pose_topic = topic_mocap_pose if topic_mocap_pose in groups else topic_odom
+	odom = _extract_odom_series(groups.get(base_pose_topic, []))
 	odom_angvel = _extract_odom_angular_velocity_series(groups.get(topic_odom, []))
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
 	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
 
 	title_prefix = csv_path.stem
+	base_title_prefix = title_prefix if base_pose_topic == topic_odom else f"{title_prefix} (mocap)"
 
 	if desired_pose is not None and real_pose is not None:
 		_plot_ee_trajectories(desired_pose, real_pose, title_prefix)
 		_plot_pose_error_norm(desired_pose, real_pose, title_prefix)
 
 	if odom is not None:
-		_plot_odometry(odom, title_prefix)
-		_plot_odometry_rms_disturbance(odom, title_prefix)
-		_plot_odometry_displacement_norms(odom, title_prefix)
+		_plot_odometry(odom, base_title_prefix)
+		_plot_odometry_rms_disturbance(odom, base_title_prefix)
+		_plot_odometry_displacement_norms(odom, base_title_prefix)
 
 	if odom_angvel is not None:
 		_plot_odometry_angular_velocity(odom_angvel, title_prefix)

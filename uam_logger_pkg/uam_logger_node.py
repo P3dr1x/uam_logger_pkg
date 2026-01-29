@@ -19,7 +19,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 
-from geometry_msgs.msg import Accel, Pose, Twist
+from geometry_msgs.msg import Accel, Pose, PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
 
@@ -103,6 +103,8 @@ class UamLoggerNode(Node):
 		self.declare_parameter("topic_desired_ee_pose", "/desired_ee_global_pose")
 
 		self.declare_parameter("topic_odometry", "/model/t960a_0/odometry")
+		# Real system (mocap): pose from motion capture (typically natnet_ros2)
+		self.declare_parameter("topic_mocap_pose", "/t960a/pose")
 		self.declare_parameter("topic_ee_pose", "/ee_world_pose")
 		self.declare_parameter("topic_joint_states", "/joint_states")
 		self.declare_parameter("topic_sensor_combined", "/fmu/out/sensor_combined")
@@ -122,6 +124,7 @@ class UamLoggerNode(Node):
 		self.topic_desired_ee_pose: str = self.get_parameter("topic_desired_ee_pose").value
 
 		self.topic_odometry: str = self.get_parameter("topic_odometry").value
+		self.topic_mocap_pose: str = self.get_parameter("topic_mocap_pose").value
 		self.topic_ee_pose: str = self.get_parameter("topic_ee_pose").value
 		self.topic_joint_states: str = self.get_parameter("topic_joint_states").value
 		self.topic_sensor_combined: str = self.get_parameter("topic_sensor_combined").value
@@ -142,6 +145,8 @@ class UamLoggerNode(Node):
 
 		# Logged data subscriptions
 		self.create_subscription(Odometry, self.topic_odometry, self._odometry_cb, 10)
+		# Optional real-only topic; if not published, no messages will arrive.
+		self.create_subscription(PoseStamped, self.topic_mocap_pose, self._mocap_pose_cb, 10)
 		self.create_subscription(Pose, self.topic_ee_pose, self._ee_pose_cb, 10)
 		self.create_subscription(JointState, self.topic_joint_states, self._joint_states_cb, 10)
 		# Optional real-only topic; if not published, no messages will arrive.
@@ -293,6 +298,36 @@ class UamLoggerNode(Node):
 				"wx": vang.x,
 				"wy": vang.y,
 				"wz": vang.z,
+			},
+		)
+
+	def _mocap_pose_cb(self, msg: PoseStamped) -> None:
+		"""Log drone pose coming from motion capture (/t960a/pose).
+
+		We store both quaternion and RPY so offline_plotting can reuse the same
+		base-drone plotting functions (which expect x/y/z + roll/pitch/yaw).
+		"""
+		if self.state != LoggerState.RECORDING:
+			return
+
+		t_ns = self._now_ns()
+		p = msg.pose.position
+		q = msg.pose.orientation
+		roll, pitch, yaw = _quat_to_rpy(q.x, q.y, q.z, q.w)
+		self._append(
+			topic=self.topic_mocap_pose,
+			t_ns=t_ns,
+			fields={
+				"x": p.x,
+				"y": p.y,
+				"z": p.z,
+				"qx": q.x,
+				"qy": q.y,
+				"qz": q.z,
+				"qw": q.w,
+				"roll": roll,
+				"pitch": pitch,
+				"yaw": yaw,
 			},
 		)
 

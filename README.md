@@ -70,9 +70,15 @@ Launch (recommended, enables sim time by default):
 ```bash
 ros2 launch uam_logger_pkg uam_logger.launch.py \
   experiment_name:=sitl_test \
+  output_dir:=~/.ros/uam_logger \
 	log_every_n:=5 \
   reference_timeout_sec:=0.5
 ```
+
+Notes:
+
+- `experiment_name` is a **prefix**: the actual file will be named like `<experiment_name>_YYYY_MM_DD_HH_MM_SS.csv`.
+- At the moment you **cannot** set the full CSV filename from the launch CLI (timestamp is always appended).
 
 Alternatively, run the node directly:
 
