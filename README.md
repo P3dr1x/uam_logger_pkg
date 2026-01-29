@@ -108,6 +108,10 @@ Topic remapping via parameters (advanced):
 
 ## Offline plotting
 
+Example output (odometry):
+
+![Example odometry plot](resource/plot_odom.png)
+
 You can generate plots from a saved CSV using:
 
 ```bash
