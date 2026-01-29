@@ -21,8 +21,10 @@ Trigger (reference) topics (any of these can start the experiment):
 Logged data topics (during RECORDING):
 
 - `/model/t960a_0/odometry` (`nav_msgs/msg/Odometry`): x,y,z, roll,pitch,yaw and twist (linear/angular velocity)
+- `/t960a/pose` (`geometry_msgs/msg/PoseStamped`) if available: motion-capture pose (x,y,z, quaternion and roll,pitch,yaw)
 - `/ee_world_pose` (`geometry_msgs/msg/Pose`): all pose fields
 - `/joint_states` (`sensor_msgs/msg/JointState`): all fields
+- `/real_t960a_twist` (`geometry_msgs/msg/Twist`) if available: real system twist (linear/angular velocity)
 - `/fmu/out/sensor_combined` (`px4_msgs/msg/SensorCombined`) if available: accelerometer linear acceleration
 
 ## Time handling (alignment)
@@ -68,10 +70,10 @@ colcon build --packages-select uam_logger_pkg
 Launch (recommended, enables sim time by default):
 
 ```bash
-ros2 launch uam_logger_pkg uam_logger.launch.py \
-  experiment_name:=sitl_test \
-  output_dir:=~/.ros/uam_logger \
-	log_every_n:=5 \
+ros2 launch uam_logger_pkg uam_logger.launch.py 
+  experiment_name:=sitl_test 
+  output_dir:=~/.ros/uam_logger 
+	log_every_n:=5 
   reference_timeout_sec:=0.5
 ```
 
@@ -86,7 +88,7 @@ Alternatively, run the node directly:
 ros2 run uam_logger_pkg uam_logger_node --ros-args -p use_sim_time:=true
 ```
 
-## Parameters
+### Parameters
 
 Common parameters:
 
