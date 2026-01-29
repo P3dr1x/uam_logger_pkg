@@ -4,8 +4,10 @@ This script loads the CSV produced by `uam_logger_node` and generates plots for:
 - Desired vs real end-effector 3D trajectory
 - Pose tracking error norm over time (nearest-timestamp matching)
 - Drone position and attitude (3x2 grid)
+- Drone RMS attitude disturbance (RMS of roll/pitch/yaw)
 - Drone displacement norms w.r.t. initial pose
-- PX4 SensorCombined accelerometer data (if present)
+- PX4 SensorCombined accelerometer + gyroscope data (if present)
+- Real drone twist components from /real_t960a_twist (if present)
 
 The CSV format is the one produced by `UamLoggerNode._save_experiment()`:
 columns: `t`, `topic`, plus topic-specific fields.
@@ -49,6 +51,29 @@ class OdomSeries:
 
 
 @dataclass(frozen=True)
+class AngularVelSeries:
+	"""Time series for angular velocity (from odometry twist.angular)."""
+
+	t: List[float]
+	wx: List[float]
+	wy: List[float]
+	wz: List[float]
+
+
+@dataclass(frozen=True)
+class TwistSeries:
+	"""Time series for Twist components."""
+
+	t: List[float]
+	vx: List[float]
+	vy: List[float]
+	vz: List[float]
+	wx: List[float]
+	wy: List[float]
+	wz: List[float]
+
+
+@dataclass(frozen=True)
 class AccelSeries:
 	"""Time series for linear accelerations."""
 
@@ -56,6 +81,16 @@ class AccelSeries:
 	ax: List[float]
 	ay: List[float]
 	az: List[float]
+
+
+@dataclass(frozen=True)
+class GyroSeries:
+	"""Time series for angular rates (body gyro)."""
+
+	t: List[float]
+	gx: List[float]
+	gy: List[float]
+	gz: List[float]
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -118,6 +153,33 @@ def _quat_angle(qx: float, qy: float, qz: float, qw: float) -> float:
 	return 2.0 * math.acos(qw)
 
 
+def _quat_to_axis_angle_vec(qx: float, qy: float, qz: float, qw: float) -> Tuple[float, float, float]:
+	"""Convert quaternion to axis-angle error vector e = axis * angle.
+
+	The returned vector is the logarithm map representation on SO(3): e in R^3.
+	Its norm is the rotation angle in [0, pi].
+	"""
+	qx, qy, qz, qw = _quat_normalize(qx, qy, qz, qw)
+	# Use the shortest rotation (double cover).
+	if qw < 0.0:
+		qx, qy, qz, qw = -qx, -qy, -qz, -qw
+
+	vn = math.sqrt(qx * qx + qy * qy + qz * qz)
+	if vn < 1e-12:
+		return 0.0, 0.0, 0.0
+
+	# Stable angle computation.
+	angle = 2.0 * math.atan2(vn, qw)
+	ax = qx / vn
+	ay = qy / vn
+	az = qz / vn
+	return ax * angle, ay * angle, az * angle
+
+
+def _rad_to_deg(a: float) -> float:
+	return a * (180.0 / math.pi)
+
+
 def _relative_rotation_angle(
 	qx_a: float,
 	qy_a: float,
@@ -134,6 +196,24 @@ def _relative_rotation_angle(
 	ix, iy, iz, iw = _quat_conj(qx_a, qy_a, qz_a, qw_a)
 	ex, ey, ez, ew = _quat_mul(ix, iy, iz, iw, qx_b, qy_b, qz_b, qw_b)
 	return _quat_angle(ex, ey, ez, ew)
+
+
+def _relative_rotation_axis_angle_vec(
+	qx_a: float,
+	qy_a: float,
+	qz_a: float,
+	qw_a: float,
+	qx_b: float,
+	qy_b: float,
+	qz_b: float,
+	qw_b: float,
+) -> Tuple[float, float, float]:
+	"""Axis-angle error vector of q_err = q_a^{-1} ⊗ q_b."""
+	qx_a, qy_a, qz_a, qw_a = _quat_normalize(qx_a, qy_a, qz_a, qw_a)
+	qx_b, qy_b, qz_b, qw_b = _quat_normalize(qx_b, qy_b, qz_b, qw_b)
+	ix, iy, iz, iw = _quat_conj(qx_a, qy_a, qz_a, qw_a)
+	ex, ey, ez, ew = _quat_mul(ix, iy, iz, iw, qx_b, qy_b, qz_b, qw_b)
+	return _quat_to_axis_angle_vec(ex, ey, ez, ew)
 
 
 def _nearest_indices(t_ref: List[float], t_query: List[float]) -> List[int]:
@@ -253,6 +333,33 @@ def _extract_odom_series(rows: List[Dict[str, str]]) -> Optional[OdomSeries]:
 	return OdomSeries(t=t, x=x, y=y, z=z, roll=roll, pitch=pitch, yaw=yaw)
 
 
+def _extract_odom_angular_velocity_series(rows: List[Dict[str, str]]) -> Optional[AngularVelSeries]:
+	"""Extract angular velocity (wx/wy/wz) time series from Odometry rows.
+
+	Expected CSV columns are wx/wy/wz (rad/s), as saved by uam_logger_node.
+	"""
+	t: List[float] = []
+	wx: List[float] = []
+	wy: List[float] = []
+	wz: List[float] = []
+
+	for r in rows:
+		t_i = _get_float(r, "t")
+		wx_i = _get_float(r, "wx")
+		wy_i = _get_float(r, "wy")
+		wz_i = _get_float(r, "wz")
+		if None in (t_i, wx_i, wy_i, wz_i):
+			continue
+		t.append(float(t_i))
+		wx.append(float(wx_i))
+		wy.append(float(wy_i))
+		wz.append(float(wz_i))
+
+	if not t:
+		return None
+	return AngularVelSeries(t=t, wx=wx, wy=wy, wz=wz)
+
+
 def _extract_accel_series(rows: List[Dict[str, str]]) -> Optional[AccelSeries]:
 	t: List[float] = []
 	ax: List[float] = []
@@ -274,6 +381,71 @@ def _extract_accel_series(rows: List[Dict[str, str]]) -> Optional[AccelSeries]:
 	if not t:
 		return None
 	return AccelSeries(t=t, ax=ax, ay=ay, az=az)
+
+
+def _extract_gyro_series(rows: List[Dict[str, str]]) -> Optional[GyroSeries]:
+	"""Extract gyro (angular velocity) time series from SensorCombined rows.
+
+	Expected CSV columns are gx/gy/gz (rad/s), as saved by uam_logger_node.
+	"""
+	t: List[float] = []
+	gx: List[float] = []
+	gy: List[float] = []
+	gz: List[float] = []
+
+	for r in rows:
+		t_i = _get_float(r, "t")
+		gx_i = _get_float(r, "gx")
+		gy_i = _get_float(r, "gy")
+		gz_i = _get_float(r, "gz")
+		# Backward/alternate naming fallback (if user has older CSVs)
+		if gx_i is None and gy_i is None and gz_i is None:
+			gx_i = _get_float(r, "wx")
+			gy_i = _get_float(r, "wy")
+			gz_i = _get_float(r, "wz")
+		if None in (t_i, gx_i, gy_i, gz_i):
+			continue
+		t.append(float(t_i))
+		gx.append(float(gx_i))
+		gy.append(float(gy_i))
+		gz.append(float(gz_i))
+
+	if not t:
+		return None
+	return GyroSeries(t=t, gx=gx, gy=gy, gz=gz)
+
+
+def _extract_twist_series(rows: List[Dict[str, str]]) -> Optional[TwistSeries]:
+	"""Extract vx/vy/vz + wx/wy/wz time series from Twist-like rows."""
+	t: List[float] = []
+	vx: List[float] = []
+	vy: List[float] = []
+	vz: List[float] = []
+	wx: List[float] = []
+	wy: List[float] = []
+	wz: List[float] = []
+
+	for r in rows:
+		t_i = _get_float(r, "t")
+		vx_i = _get_float(r, "vx")
+		vy_i = _get_float(r, "vy")
+		vz_i = _get_float(r, "vz")
+		wx_i = _get_float(r, "wx")
+		wy_i = _get_float(r, "wy")
+		wz_i = _get_float(r, "wz")
+		if None in (t_i, vx_i, vy_i, vz_i, wx_i, wy_i, wz_i):
+			continue
+		t.append(float(t_i))
+		vx.append(float(vx_i))
+		vy.append(float(vy_i))
+		vz.append(float(vz_i))
+		wx.append(float(wx_i))
+		wy.append(float(wy_i))
+		wz.append(float(wz_i))
+
+	if not t:
+		return None
+	return TwistSeries(t=t, vx=vx, vy=vy, vz=vz, wx=wx, wy=wy, wz=wz)
 
 
 def _plot_ee_trajectories(desired: PoseSeries, real: PoseSeries, title_prefix: str) -> None:
@@ -380,6 +552,7 @@ def _plot_ee_trajectories(desired: PoseSeries, real: PoseSeries, title_prefix: s
 		ax.set_ylim(y0 - perp_scale * max_dev, y0 + perp_scale * max_dev)
 
 
+
 def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: str) -> None:
 	import matplotlib.pyplot as plt
 
@@ -388,21 +561,40 @@ def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: s
 		return
 
 	err_t: List[float] = []
-	err_norm: List[float] = []
+	pos_err_norm: List[float] = []
+	ori_err_norm_deg: List[float] = []
 	for k, j in enumerate(idx):
 		dx = desired.px[k] - real.px[j]
 		dy = desired.py[k] - real.py[j]
 		dz = desired.pz[k] - real.pz[j]
 		pos_err = math.sqrt(dx * dx + dy * dy + dz * dz)
+		ex, ey, ez = _relative_rotation_axis_angle_vec(
+			desired.qx[k],
+			desired.qy[k],
+			desired.qz[k],
+			desired.qw[k],
+			real.qx[j],
+			real.qy[j],
+			real.qz[j],
+			real.qw[j],
+		)
+		ori_err = math.sqrt(ex * ex + ey * ey + ez * ez)
+		ori_err_deg = _rad_to_deg(ori_err)
 		err_t.append(desired.t[k])
-		err_norm.append(pos_err)
+		pos_err_norm.append(pos_err)
+		ori_err_norm_deg.append(ori_err_deg)
 
-	plt.figure()
-	plt.plot(err_t, err_norm, color="red")
-	plt.grid(True)
-	plt.title(f"{title_prefix} - Position error norm (nearest-timestamp matching)")
-	plt.xlabel("t [s] (desired timestamps)")
-	plt.ylabel(r"$\||e_p\||\;[m]$")
+	fig, axs = plt.subplots(2, 1, sharex=True)
+	fig.suptitle(f"{title_prefix} - EE Pose tracking errors")
+
+	axs[0].plot(err_t, pos_err_norm, color="red")
+	axs[0].grid(True)
+	axs[0].set_ylabel(r"$\|\|e_p\|\|\;[m]$")
+
+	axs[1].plot(err_t, ori_err_norm_deg, color="red")
+	axs[1].grid(True)
+	axs[1].set_xlabel("t [s] (desired timestamps)")
+	axs[1].set_ylabel(r"$\|\|e_R\|\|\;[°]$")
 
 
 def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
@@ -416,9 +608,9 @@ def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
 	dy = [y - y0 for y in odom.y]
 	dz = [z - z0 for z in odom.z]
 
-	droll = [_wrap_to_pi(r - r0) for r in odom.roll]
-	dpitch = [_wrap_to_pi(p - p0) for p in odom.pitch]
-	dyaw = [_wrap_to_pi(yw - yw0) for yw in odom.yaw]
+	droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
+	dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
+	dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
 
 	fig, axs = plt.subplots(3, 2, sharex=True)
 	fig.suptitle(f"{title_prefix} - Drone odometry")
@@ -436,9 +628,9 @@ def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
 	axs[0, 1].plot(odom.t, droll, color="red")
 	axs[1, 1].plot(odom.t, dpitch, color=(31 / 255, 230 / 255, 51 / 255))
 	axs[2, 1].plot(odom.t, dyaw, color="blue")
-	axs[0, 1].set_ylabel("Δroll [rad]")
-	axs[1, 1].set_ylabel("Δpitch [rad]")
-	axs[2, 1].set_ylabel("Δyaw [rad]")
+	axs[0, 1].set_ylabel("Δroll [°]")
+	axs[1, 1].set_ylabel("Δpitch [°]")
+	axs[2, 1].set_ylabel("Δyaw [°]")
 	axs[2, 1].set_xlabel("t [s]")
 	for i in range(3):
 		axs[i, 1].grid(True)
@@ -454,7 +646,7 @@ def _plot_odometry_displacement_norms(odom: OdomSeries, title_prefix: str) -> No
 	q0x, q0y, q0z, q0w = _rpy_to_quat(odom.roll[0], odom.pitch[0], odom.yaw[0])
 
 	pos_norm: List[float] = []
-	ang_norm: List[float] = []
+	ang_disp_norm_deg: List[float] = []
 	for k in range(len(odom.t)):
 		dx = odom.x[k] - x0
 		dy = odom.y[k] - y0
@@ -462,41 +654,181 @@ def _plot_odometry_displacement_norms(odom: OdomSeries, title_prefix: str) -> No
 		pos_norm.append(math.sqrt(dx * dx + dy * dy + dz * dz))
 
 		qkx, qky, qkz, qkw = _rpy_to_quat(odom.roll[k], odom.pitch[k], odom.yaw[k])
-		ang_norm.append(
-			_relative_rotation_angle(q0x, q0y, q0z, q0w, qkx, qky, qkz, qkw)
-		)
+		ex, ey, ez = _relative_rotation_axis_angle_vec(q0x, q0y, q0z, q0w, qkx, qky, qkz, qkw)
+		ang_disp_norm_deg.append(_rad_to_deg(math.sqrt(ex * ex + ey * ey + ez * ez)))
 
 	fig, ax1 = plt.subplots()
 	ax2 = ax1.twinx()
 
 	ln1 = ax1.plot(odom.t, pos_norm, label="||Δp||", color="tab:blue")
-	ln2 = ax2.plot(odom.t, ang_norm, label="angle(ΔR)", color="tab:orange")
+	ln2 = ax2.plot(odom.t, ang_disp_norm_deg, label="||Δθ||", color="tab:orange")
 
 	ax1.grid(True)
 	ax1.set_title(f"{title_prefix} - Drone displacement norms")
 	ax1.set_xlabel("t [s]")
 	ax1.set_ylabel("||Δp|| [m]")
-	ax2.set_ylabel("angle(ΔR) [rad]")
+	ax2.set_ylabel("||Δθ|| [°]")
 
 	lines = ln1 + ln2
 	labels = [l.get_label() for l in lines]
 	ax1.legend(lines, labels, loc="best")
 
 
-def _plot_accel(accel: AccelSeries, title_prefix: str) -> None:
+def _plot_odometry_angular_velocity(angvel: AngularVelSeries, title_prefix: str) -> None:
 	import matplotlib.pyplot as plt
 
+	if not angvel.t:
+		return
+
+	wx_deg_s = [_rad_to_deg(w) for w in angvel.wx]
+	wy_deg_s = [_rad_to_deg(w) for w in angvel.wy]
+	wz_deg_s = [_rad_to_deg(w) for w in angvel.wz]
+
 	fig, axs = plt.subplots(3, 1, sharex=True)
-	fig.suptitle(f"{title_prefix} - SensorCombined accelerometer")
-	axs[0].plot(accel.t, accel.ax)
-	axs[1].plot(accel.t, accel.ay)
-	axs[2].plot(accel.t, accel.az)
-	axs[0].set_ylabel("ax [m/s^2]")
-	axs[1].set_ylabel("ay [m/s^2]")
-	axs[2].set_ylabel("az [m/s^2]")
+	fig.suptitle(f"{title_prefix} - Drone angular velocity (odometry)")
+
+	axs[0].plot(angvel.t, wx_deg_s, color="red")
+	axs[1].plot(angvel.t, wy_deg_s, color=(31 / 255, 230 / 255, 51 / 255))
+	axs[2].plot(angvel.t, wz_deg_s, color="blue")
+	axs[0].set_ylabel("ωx [°/s]")
+	axs[1].set_ylabel("ωy [°/s]")
+	axs[2].set_ylabel("ωz [°/s]")
 	axs[2].set_xlabel("t [s]")
 	for ax in axs:
 		ax.grid(True)
+
+
+def _plot_odometry_rms_disturbance(odom: OdomSeries, title_prefix: str) -> None:
+	"""Plot RMS disturbance of base attitude.
+
+	Computed as RMS of the three attitude angle deviations (roll, pitch, yaw)
+	with respect to the initial attitude.
+	"""
+	import matplotlib.pyplot as plt
+
+	if not odom.t:
+		return
+
+	r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
+	# Disturbance angles (deg)
+	droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
+	dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
+	dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
+
+	rms: List[float] = []
+	for dr, dp, dy in zip(droll, dpitch, dyaw):
+		rms.append(math.sqrt((dr * dr + dp * dp + dy * dy) / 3.0))
+
+	plt.figure()
+	plt.plot(odom.t, rms, color="purple")
+	plt.grid(True)
+	plt.title(f"{title_prefix} - $\\delta_{{RMS}}$ disturbance (attitude)")
+	plt.xlabel("t [s]")
+	plt.ylabel(r"$\delta_{RMS}$ [°]")
+
+
+def _plot_sensor_combined_imu(
+	accel: Optional[AccelSeries],
+	gyro: Optional[GyroSeries],
+	title_prefix: str,
+) -> None:
+	import matplotlib.pyplot as plt
+
+	if accel is None and gyro is None:
+		return
+
+	if accel is not None and gyro is not None:
+		fig, axs = plt.subplots(3, 2, sharex=True)
+		fig.suptitle(f"{title_prefix} - SensorCombined IMU")
+
+		axs[0, 0].plot(accel.t, accel.ax)
+		axs[1, 0].plot(accel.t, accel.ay)
+		axs[2, 0].plot(accel.t, accel.az)
+		axs[0, 0].set_ylabel("ax [m/s^2]")
+		axs[1, 0].set_ylabel("ay [m/s^2]")
+		axs[2, 0].set_ylabel("az [m/s^2]")
+		axs[2, 0].set_xlabel("t [s]")
+		for i in range(3):
+			axs[i, 0].grid(True)
+
+		gx_deg_s = [_rad_to_deg(w) for w in gyro.gx]
+		gy_deg_s = [_rad_to_deg(w) for w in gyro.gy]
+		gz_deg_s = [_rad_to_deg(w) for w in gyro.gz]
+		axs[0, 1].plot(gyro.t, gx_deg_s)
+		axs[1, 1].plot(gyro.t, gy_deg_s)
+		axs[2, 1].plot(gyro.t, gz_deg_s)
+		axs[0, 1].set_ylabel("ωx [°/s]")
+		axs[1, 1].set_ylabel("ωy [°/s]")
+		axs[2, 1].set_ylabel("ωz [°/s]")
+		axs[2, 1].set_xlabel("t [s]")
+		for i in range(3):
+			axs[i, 1].grid(True)
+		return
+
+	# Fallback: keep backward-compatible behavior if only one of the two exists.
+	if accel is not None:
+		fig, axs = plt.subplots(3, 1, sharex=True)
+		fig.suptitle(f"{title_prefix} - SensorCombined accelerometer")
+		axs[0].plot(accel.t, accel.ax)
+		axs[1].plot(accel.t, accel.ay)
+		axs[2].plot(accel.t, accel.az)
+		axs[0].set_ylabel("ax [m/s^2]")
+		axs[1].set_ylabel("ay [m/s^2]")
+		axs[2].set_ylabel("az [m/s^2]")
+		axs[2].set_xlabel("t [s]")
+		for ax in axs:
+			ax.grid(True)
+
+
+def _plot_real_t960a_twist(twist: TwistSeries, title_prefix: str) -> None:
+	import matplotlib.pyplot as plt
+
+	if not twist.t:
+		return
+
+	wx_deg_s = [_rad_to_deg(w) for w in twist.wx]
+	wy_deg_s = [_rad_to_deg(w) for w in twist.wy]
+	wz_deg_s = [_rad_to_deg(w) for w in twist.wz]
+
+	fig, axs = plt.subplots(3, 2, sharex=True)
+	fig.suptitle(f"{title_prefix} - Real drone twist (/real_t960a_twist)")
+
+	axs[0, 0].plot(twist.t, twist.vx, color="red")
+	axs[1, 0].plot(twist.t, twist.vy, color=(31 / 255, 230 / 255, 51 / 255))
+	axs[2, 0].plot(twist.t, twist.vz, color="blue")
+	axs[0, 0].set_ylabel("vx [m/s]")
+	axs[1, 0].set_ylabel("vy [m/s]")
+	axs[2, 0].set_ylabel("vz [m/s]")
+	axs[2, 0].set_xlabel("t [s]")
+	for i in range(3):
+		axs[i, 0].grid(True)
+
+	axs[0, 1].plot(twist.t, wx_deg_s, color="red")
+	axs[1, 1].plot(twist.t, wy_deg_s, color=(31 / 255, 230 / 255, 51 / 255))
+	axs[2, 1].plot(twist.t, wz_deg_s, color="blue")
+	axs[0, 1].set_ylabel("ωx [°/s]")
+	axs[1, 1].set_ylabel("ωy [°/s]")
+	axs[2, 1].set_ylabel("ωz [°/s]")
+	axs[2, 1].set_xlabel("t [s]")
+	for i in range(3):
+		axs[i, 1].grid(True)
+		return
+
+	if gyro is not None:
+		fig, axs = plt.subplots(3, 1, sharex=True)
+		fig.suptitle(f"{title_prefix} - SensorCombined gyroscope")
+		gx_deg_s = [_rad_to_deg(w) for w in gyro.gx]
+		gy_deg_s = [_rad_to_deg(w) for w in gyro.gy]
+		gz_deg_s = [_rad_to_deg(w) for w in gyro.gz]
+		axs[0].plot(gyro.t, gx_deg_s)
+		axs[1].plot(gyro.t, gy_deg_s)
+		axs[2].plot(gyro.t, gz_deg_s)
+		axs[0].set_ylabel("ωx [°/s]")
+		axs[1].set_ylabel("ωy [°/s]")
+		axs[2].set_ylabel("ωz [°/s]")
+		axs[2].set_xlabel("t [s]")
+		for ax in axs:
+			ax.grid(True)
 
 
 def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
@@ -521,11 +853,15 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	topic_real_pose = "/ee_world_pose"
 	topic_odom = "/model/t960a_0/odometry"
 	topic_sensor = "/fmu/out/sensor_combined"
+	topic_real_twist = "/real_t960a_twist"
 
 	desired_pose = _extract_pose_series(groups.get(topic_desired_pose, []))
 	real_pose = _extract_pose_series(groups.get(topic_real_pose, []))
 	odom = _extract_odom_series(groups.get(topic_odom, []))
+	odom_angvel = _extract_odom_angular_velocity_series(groups.get(topic_odom, []))
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
+	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
+	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
 
 	title_prefix = csv_path.stem
 
@@ -535,10 +871,17 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 
 	if odom is not None:
 		_plot_odometry(odom, title_prefix)
+		_plot_odometry_rms_disturbance(odom, title_prefix)
 		_plot_odometry_displacement_norms(odom, title_prefix)
 
-	if accel is not None:
-		_plot_accel(accel, title_prefix)
+	if odom_angvel is not None:
+		_plot_odometry_angular_velocity(odom_angvel, title_prefix)
+
+	if accel is not None or gyro is not None:
+		_plot_sensor_combined_imu(accel, gyro, title_prefix)
+
+	if real_twist is not None:
+		_plot_real_t960a_twist(real_twist, title_prefix)
 
 	if save_dir is not None:
 		save_dir.mkdir(parents=True, exist_ok=True)

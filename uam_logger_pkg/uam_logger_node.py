@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
 
 from geometry_msgs.msg import Accel, Pose, Twist
 from nav_msgs.msg import Odometry
@@ -105,6 +106,7 @@ class UamLoggerNode(Node):
 		self.declare_parameter("topic_ee_pose", "/ee_world_pose")
 		self.declare_parameter("topic_joint_states", "/joint_states")
 		self.declare_parameter("topic_sensor_combined", "/fmu/out/sensor_combined")
+		self.declare_parameter("topic_real_t960a_twist", "/real_t960a_twist")
 
 		self.experiment_name: str = self.get_parameter("experiment_name").value
 		# Expand '~' so output goes to the real home directory.
@@ -123,6 +125,7 @@ class UamLoggerNode(Node):
 		self.topic_ee_pose: str = self.get_parameter("topic_ee_pose").value
 		self.topic_joint_states: str = self.get_parameter("topic_joint_states").value
 		self.topic_sensor_combined: str = self.get_parameter("topic_sensor_combined").value
+		self.topic_real_t960a_twist: str = self.get_parameter("topic_real_t960a_twist").value
 
 		self.state: LoggerState = LoggerState.IDLE
 
@@ -141,13 +144,15 @@ class UamLoggerNode(Node):
 		self.create_subscription(Odometry, self.topic_odometry, self._odometry_cb, 10)
 		self.create_subscription(Pose, self.topic_ee_pose, self._ee_pose_cb, 10)
 		self.create_subscription(JointState, self.topic_joint_states, self._joint_states_cb, 10)
+		# Optional real-only topic; if not published, no messages will arrive.
+		self.create_subscription(Twist, self.topic_real_t960a_twist, self._real_t960a_twist_cb, 10)
 
 		if HAVE_PX4_MSGS:
 			self.create_subscription(  # type: ignore[arg-type]
 				SensorCombined,
 				self.topic_sensor_combined,
 				self._sensor_combined_cb,  # type: ignore[arg-type]
-				10,
+				qos_profile_sensor_data,
 			)
 		else:
 			self.get_logger().warn(
@@ -336,12 +341,27 @@ class UamLoggerNode(Node):
 		elif hasattr(msg, "accel_m_s2"):
 			accel = getattr(msg, "accel_m_s2")
 
+		gyro = None
+		if hasattr(msg, "gyro_rad"):
+			gyro = getattr(msg, "gyro_rad")
+		elif hasattr(msg, "gyro"):
+			gyro = getattr(msg, "gyro")
+
 		if accel is None:
 			return
 
 		ax = float(accel[0])
 		ay = float(accel[1])
 		az = float(accel[2])
+
+		gx = gy = gz = None
+		if gyro is not None:
+			try:
+				gx = float(gyro[0])
+				gy = float(gyro[1])
+				gz = float(gyro[2])
+			except Exception:
+				gx = gy = gz = None
 
 		self._append(
 			topic=self.topic_sensor_combined,
@@ -350,6 +370,26 @@ class UamLoggerNode(Node):
 				"ax": ax,
 				"ay": ay,
 				"az": az,
+				"gx": gx,
+				"gy": gy,
+				"gz": gz,
+			},
+		)
+
+	def _real_t960a_twist_cb(self, msg: Twist) -> None:
+		if self.state != LoggerState.RECORDING:
+			return
+		t_ns = self._now_ns()
+		self._append(
+			topic=self.topic_real_t960a_twist,
+			t_ns=t_ns,
+			fields={
+				"vx": msg.linear.x,
+				"vy": msg.linear.y,
+				"vz": msg.linear.z,
+				"wx": msg.angular.x,
+				"wy": msg.angular.y,
+				"wz": msg.angular.z,
 			},
 		)
 
