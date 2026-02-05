@@ -20,7 +20,7 @@ import csv
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -91,6 +91,24 @@ class GyroSeries:
 	gx: List[float]
 	gy: List[float]
 	gz: List[float]
+
+
+@dataclass(frozen=True)
+class ExperimentData:
+	"""All time-series extracted from a single CSV file."""
+
+	label: str
+	csv_path: Path
+
+	desired_pose: Optional[PoseSeries]
+	real_pose: Optional[PoseSeries]
+
+	# Base drone pose used for plotting: odometry in sim, mocap pose in real.
+	base_pose_topic: str
+	odom: Optional[OdomSeries]
+
+	accel: Optional[AccelSeries]
+	gyro: Optional[GyroSeries]
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -238,6 +256,79 @@ def _nearest_indices(t_ref: List[float], t_query: List[float]) -> List[int]:
 		else:
 			indices.append(j)
 	return indices
+
+
+def _compute_pose_tracking_errors(
+	desired: PoseSeries, real: PoseSeries
+) -> Tuple[List[float], List[float], List[float]]:
+	"""Compute position/orientation tracking errors using nearest-timestamp matching.
+
+	The returned timestamps are the desired trajectory timestamps.
+
+	Returns:
+		err_t: timestamps (seconds)
+		pos_err_norm: ||e_p|| [m]
+		ori_err_norm_deg: ||e_R|| [deg], using axis-angle log map norm
+	"""
+	idx = _nearest_indices(real.t, desired.t)
+	if not idx:
+		return [], [], []
+
+	err_t: List[float] = []
+	pos_err_norm: List[float] = []
+	ori_err_norm_deg: List[float] = []
+	for k, j in enumerate(idx):
+		dx = desired.px[k] - real.px[j]
+		dy = desired.py[k] - real.py[j]
+		dz = desired.pz[k] - real.pz[j]
+		pos_err = math.sqrt(dx * dx + dy * dy + dz * dz)
+		ex, ey, ez = _relative_rotation_axis_angle_vec(
+			desired.qx[k],
+			desired.qy[k],
+			desired.qz[k],
+			desired.qw[k],
+			real.qx[j],
+			real.qy[j],
+			real.qz[j],
+			real.qw[j],
+		)
+		ori_err = math.sqrt(ex * ex + ey * ey + ez * ez)
+		ori_err_deg = _rad_to_deg(ori_err)
+		err_t.append(desired.t[k])
+		pos_err_norm.append(pos_err)
+		ori_err_norm_deg.append(ori_err_deg)
+
+	return err_t, pos_err_norm, ori_err_norm_deg
+
+
+def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
+	groups = _load_csv_grouped(csv_path)
+
+	topic_desired_pose = "/desired_ee_global_pose"
+	topic_real_pose = "/ee_world_pose"
+	topic_odom = "/model/t960a_0/odometry"
+	topic_mocap_pose = "/t960a/pose"
+	topic_sensor = "/fmu/out/sensor_combined"
+
+	desired_pose = _extract_pose_series(groups.get(topic_desired_pose, []))
+	real_pose = _extract_pose_series(groups.get(topic_real_pose, []))
+
+	base_pose_topic = topic_mocap_pose if topic_mocap_pose in groups else topic_odom
+	odom = _extract_odom_series(groups.get(base_pose_topic, []))
+
+	accel = _extract_accel_series(groups.get(topic_sensor, []))
+	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
+
+	return ExperimentData(
+		label=label,
+		csv_path=csv_path,
+		desired_pose=desired_pose,
+		real_pose=real_pose,
+		base_pose_topic=base_pose_topic,
+		odom=odom,
+		accel=accel,
+		gyro=gyro,
+	)
 
 
 def _load_csv_grouped(csv_path: Path) -> Dict[str, List[Dict[str, str]]]:
@@ -556,33 +647,9 @@ def _plot_ee_trajectories(desired: PoseSeries, real: PoseSeries, title_prefix: s
 def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: str) -> None:
 	import matplotlib.pyplot as plt
 
-	idx = _nearest_indices(real.t, desired.t)
-	if not idx:
+	err_t, pos_err_norm, ori_err_norm_deg = _compute_pose_tracking_errors(desired, real)
+	if not err_t:
 		return
-
-	err_t: List[float] = []
-	pos_err_norm: List[float] = []
-	ori_err_norm_deg: List[float] = []
-	for k, j in enumerate(idx):
-		dx = desired.px[k] - real.px[j]
-		dy = desired.py[k] - real.py[j]
-		dz = desired.pz[k] - real.pz[j]
-		pos_err = math.sqrt(dx * dx + dy * dy + dz * dz)
-		ex, ey, ez = _relative_rotation_axis_angle_vec(
-			desired.qx[k],
-			desired.qy[k],
-			desired.qz[k],
-			desired.qw[k],
-			real.qx[j],
-			real.qy[j],
-			real.qz[j],
-			real.qw[j],
-		)
-		ori_err = math.sqrt(ex * ex + ey * ey + ez * ez)
-		ori_err_deg = _rad_to_deg(ori_err)
-		err_t.append(desired.t[k])
-		pos_err_norm.append(pos_err)
-		ori_err_norm_deg.append(ori_err_deg)
 
 	fig, axs = plt.subplots(2, 1, sharex=True)
 	fig.suptitle(f"{title_prefix} - EE Pose tracking errors")
@@ -595,6 +662,304 @@ def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: s
 	axs[1].grid(True)
 	axs[1].set_xlabel("t [s] (desired timestamps)")
 	axs[1].set_ylabel(r"$\|\|e_R\|\|\;[°]$")
+
+
+def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> None:
+	"""Plot desired vs real EE trajectory for multiple experiments.
+
+	For each experiment, desired is translated so that it starts at (0,0,0), and
+	the same translation is applied to the real EE trajectory. This matches the
+	comparison strategy described in logger_instructions.md.
+	"""
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.desired_pose is not None and e.real_pose is not None]
+	if not usable:
+		return
+
+	def _rotate_about_z(x: float, y: float, yaw: float) -> Tuple[float, float]:
+		c = math.cos(yaw)
+		s = math.sin(yaw)
+		xr = c * x - s * y
+		yr = s * x + c * y
+		return xr, yr
+
+	def _estimate_yaw_to_match_reference(
+		ref_x: List[float],
+		ref_y: List[float],
+		x: List[float],
+		y: List[float],
+	) -> float:
+		"""Return yaw (rad) that best aligns (x,y) to (ref_x,ref_y) in least squares.
+
+		Both trajectories are assumed already translated so they start at the origin.
+		The result is a rotation about +Z applied to (x,y).
+		"""
+		m = min(len(ref_x), len(x), len(ref_y), len(y))
+		if m < 2:
+			return 0.0
+
+		# Use a uniform subsampling to avoid overweighting very dense logs.
+		max_points = 300
+		step = max(1, m // max_points)
+
+		a = 0.0
+		b = 0.0
+		energy_ref = 0.0
+		energy_cur = 0.0
+		for i in range(0, m, step):
+			cx = x[i]
+			cy = y[i]
+			rx = ref_x[i]
+			ry_ref = ref_y[i]
+			# a = sum(c · r)
+			a += cx * rx + cy * ry_ref
+			# b = sum(c_x r_y - c_y r_x)
+			b += cx * ry_ref - cy * rx
+			energy_ref += rx * rx + ry_ref * ry_ref
+			energy_cur += cx * cx + cy * cy
+
+		if energy_ref < 1e-12 or energy_cur < 1e-12:
+			return 0.0
+		return math.atan2(b, a)
+
+	fig = plt.figure()
+	ax = fig.add_subplot(111, projection="3d")
+	fig.suptitle(
+		"End-effector trajectories (comparison, translated + yaw-aligned desired)"
+	)
+
+	# Build reference (first usable experiment) desired trajectory, translated to start.
+	ref_exp = usable[0]
+	ref_desired = ref_exp.desired_pose
+	assert ref_desired is not None
+	ref_x0, ref_y0, ref_z0 = ref_desired.px[0], ref_desired.py[0], ref_desired.pz[0]
+	ref_dx = [x - ref_x0 for x in ref_desired.px]
+	ref_dy = [y - ref_y0 for y in ref_desired.py]
+
+	colors = plt.get_cmap("tab10")
+	for i, exp in enumerate(usable):
+		desired = exp.desired_pose
+		real = exp.real_pose
+		assert desired is not None
+		assert real is not None
+
+		x0, y0, z0 = desired.px[0], desired.py[0], desired.pz[0]
+		dx = [x - x0 for x in desired.px]
+		dy = [y - y0 for y in desired.py]
+		dz = [z - z0 for z in desired.pz]
+		rx = [x - x0 for x in real.px]
+		ry_ = [y - y0 for y in real.py]
+		rz = [z - z0 for z in real.pz]
+
+		# Estimate yaw offset so that the desired trajectory aligns to the reference desired.
+		# This makes identical desired trajectories overlap even if experiments started
+		# from different vehicle yaw orientations.
+		yaw_align = 0.0 if exp is ref_exp else _estimate_yaw_to_match_reference(ref_dx, ref_dy, dx, dy)
+		if yaw_align != 0.0:
+			dx_r: List[float] = []
+			dy_r: List[float] = []
+			rx_r: List[float] = []
+			ry_r: List[float] = []
+			for xx, yy in zip(dx, dy):
+				xr, yr = _rotate_about_z(xx, yy, yaw_align)
+				dx_r.append(xr)
+				dy_r.append(yr)
+			for xx, yy in zip(rx, ry_):
+				xr, yr = _rotate_about_z(xx, yy, yaw_align)
+				rx_r.append(xr)
+				ry_r.append(yr)
+			dx, dy = dx_r, dy_r
+			rx, ry_ = rx_r, ry_r
+
+		color = colors(i % 10)
+		ax.plot(dx, dy, dz, linestyle="--", color=color, alpha=0.7, label=f"{exp.label} desired")
+		ax.plot(rx, ry_, rz, linestyle="-", color=color, alpha=1.0, label=f"{exp.label} real")
+
+		if rx and ry_ and rz:
+			ax.scatter(rx[0], ry_[0], rz[0], color=color, marker="o", s=25)
+			ax.scatter(rx[-1], ry_[-1], rz[-1], color=color, marker="x", s=35)
+
+	ax.set_xlabel("x [m]")
+	ax.set_ylabel("y [m]")
+	ax.set_zlabel("z [m]")
+	ax.legend(loc="best")
+
+
+def _plot_pose_error_norm_comparison(experiments: Sequence[ExperimentData]) -> None:
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.desired_pose is not None and e.real_pose is not None]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(2, 1, sharex=True)
+	fig.suptitle("EE Pose tracking errors (comparison)")
+
+	for exp in usable:
+		desired = exp.desired_pose
+		real = exp.real_pose
+		assert desired is not None
+		assert real is not None
+		err_t, pos_err, ori_err_deg = _compute_pose_tracking_errors(desired, real)
+		if not err_t:
+			continue
+		axs[0].plot(err_t, pos_err, label=exp.label)
+		axs[1].plot(err_t, ori_err_deg, label=exp.label)
+
+	for ax in axs:
+		ax.grid(True)
+		ax.legend(loc="best")
+	axs[0].set_ylabel(r"$\|\|e_p\|\|\;[m]$")
+	axs[1].set_xlabel("t [s] (desired timestamps)")
+	axs[1].set_ylabel(r"$\|\|e_R\|\|\;[°]$")
+
+
+def _plot_odometry_comparison(experiments: Sequence[ExperimentData]) -> None:
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.odom is not None]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(3, 2, sharex=True)
+	fig.suptitle("Drone odometry (comparison, deviations from initial)")
+
+	for exp in usable:
+		odom = exp.odom
+		assert odom is not None
+		x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
+		r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
+
+		dx = [x - x0 for x in odom.x]
+		dy = [y - y0 for y in odom.y]
+		dz = [z - z0 for z in odom.z]
+		droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
+		dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
+		dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
+
+		axs[0, 0].plot(odom.t, dx, label=exp.label)
+		axs[1, 0].plot(odom.t, dy, label=exp.label)
+		axs[2, 0].plot(odom.t, dz, label=exp.label)
+		axs[0, 1].plot(odom.t, droll, label=exp.label)
+		axs[1, 1].plot(odom.t, dpitch, label=exp.label)
+		axs[2, 1].plot(odom.t, dyaw, label=exp.label)
+
+	axs[0, 0].set_ylabel("Δx [m]")
+	axs[1, 0].set_ylabel("Δy [m]")
+	axs[2, 0].set_ylabel("Δz [m]")
+	axs[2, 0].set_xlabel("t [s]")
+	axs[0, 1].set_ylabel("Δroll [°]")
+	axs[1, 1].set_ylabel("Δpitch [°]")
+	axs[2, 1].set_ylabel("Δyaw [°]")
+	axs[2, 1].set_xlabel("t [s]")
+
+	for i in range(3):
+		for j in range(2):
+			axs[i, j].grid(True)
+			axs[i, j].legend(loc="best")
+
+
+def _plot_odometry_displacement_norms_comparison(experiments: Sequence[ExperimentData]) -> None:
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.odom is not None and e.odom.t]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(2, 1, sharex=True)
+	fig.suptitle("Drone displacement norms (comparison)")
+
+	for exp in usable:
+		odom = exp.odom
+		assert odom is not None
+		x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
+		q0x, q0y, q0z, q0w = _rpy_to_quat(odom.roll[0], odom.pitch[0], odom.yaw[0])
+
+		pos_norm: List[float] = []
+		ang_disp_norm_deg: List[float] = []
+		for k in range(len(odom.t)):
+			dx = odom.x[k] - x0
+			dy = odom.y[k] - y0
+			dz = odom.z[k] - z0
+			pos_norm.append(math.sqrt(dx * dx + dy * dy + dz * dz))
+
+			qkx, qky, qkz, qkw = _rpy_to_quat(odom.roll[k], odom.pitch[k], odom.yaw[k])
+			ex, ey, ez = _relative_rotation_axis_angle_vec(
+				q0x, q0y, q0z, q0w, qkx, qky, qkz, qkw
+			)
+			ang_disp_norm_deg.append(_rad_to_deg(math.sqrt(ex * ex + ey * ey + ez * ez)))
+
+		axs[0].plot(odom.t, pos_norm, label=exp.label)
+		axs[1].plot(odom.t, ang_disp_norm_deg, label=exp.label)
+
+	for ax in axs:
+		ax.grid(True)
+		ax.legend(loc="best")
+	axs[0].set_ylabel("||Δp|| [m]")
+	axs[1].set_ylabel("||Δθ|| [°]")
+	axs[1].set_xlabel("t [s]")
+
+
+def _plot_odometry_rms_disturbance_comparison(experiments: Sequence[ExperimentData]) -> None:
+	"""Overlay RMS attitude disturbance across experiments.
+
+	RMS is computed from roll/pitch/yaw deviations (deg) w.r.t. initial attitude:
+	RMS = sqrt((droll^2 + dpitch^2 + dyaw^2) / 3).
+	"""
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.odom is not None and e.odom.t]
+	if not usable:
+		return
+
+	fig, ax = plt.subplots()
+	fig.suptitle("Drone attitude disturbance (RMS, comparison)")
+
+	for exp in usable:
+		odom = exp.odom
+		assert odom is not None
+		r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
+		droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
+		dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
+		dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
+
+		rms: List[float] = []
+		for dr, dp, dy in zip(droll, dpitch, dyaw):
+			rms.append(math.sqrt((dr * dr + dp * dp + dy * dy) / 3.0))
+
+		ax.plot(odom.t, rms, label=exp.label)
+
+	ax.grid(True)
+	ax.set_xlabel("t [s]")
+	ax.set_ylabel("RMS [°]")
+	ax.legend(loc="best")
+
+
+def _plot_sensor_combined_accel_comparison(experiments: Sequence[ExperimentData]) -> None:
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.accel is not None and e.accel.t]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(3, 1, sharex=True)
+	fig.suptitle("SensorCombined accelerometer (comparison)")
+
+	for exp in usable:
+		accel = exp.accel
+		assert accel is not None
+		axs[0].plot(accel.t, accel.ax, label=exp.label)
+		axs[1].plot(accel.t, accel.ay, label=exp.label)
+		axs[2].plot(accel.t, accel.az, label=exp.label)
+
+	axs[0].set_ylabel("ax [m/s^2]")
+	axs[1].set_ylabel("ay [m/s^2]")
+	axs[2].set_ylabel("az [m/s^2]")
+	axs[2].set_xlabel("t [s]")
+	for ax in axs:
+		ax.grid(True)
+		ax.legend(loc="best")
 
 
 def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
@@ -816,13 +1181,7 @@ def _plot_real_t960a_twist(twist: TwistSeries, title_prefix: str) -> None:
 
 
 def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
-	"""Generate plots from a uam_logger_pkg CSV file.
-
-	Args:
-		csv_path: Path to the CSV produced by the logger.
-		show: If True, opens matplotlib GUI windows.
-		save_dir: If set, saves figures as PNG in this directory.
-	"""
+	"""Generate plots from a single uam_logger_pkg CSV file."""
 	try:
 		import matplotlib.pyplot as plt
 	except Exception as e:
@@ -886,12 +1245,78 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 		plt.close("all")
 
 
+def run_comparison(
+	csv_paths: Sequence[Path],
+	show: bool,
+	save_dir: Optional[Path],
+	labels: Optional[Sequence[str]] = None,
+) -> None:
+	"""Generate comparison plots from multiple CSV files.
+
+	The script overlays multiple experiments on the same figures to make
+	performance comparisons easier.
+	"""
+	try:
+		import matplotlib.pyplot as plt
+	except Exception as e:
+		raise RuntimeError(
+			"matplotlib non disponibile. Installa ad esempio: "
+			"sudo apt install python3-matplotlib"
+		) from e
+
+	if not csv_paths:
+		return
+
+	normalized_paths = [p.expanduser() for p in csv_paths]
+	for p in normalized_paths:
+		if not p.exists():
+			raise FileNotFoundError(f"CSV non trovato: {p}")
+
+	if labels is not None and len(labels) != len(normalized_paths):
+		raise ValueError("--labels deve avere la stessa lunghezza di --csv")
+
+	experiments: List[ExperimentData] = []
+	for i, p in enumerate(normalized_paths):
+		label = labels[i] if labels is not None else p.stem
+		experiments.append(_load_experiment(p, label=label))
+
+	_plot_ee_trajectories_comparison(experiments)
+	_plot_pose_error_norm_comparison(experiments)
+	_plot_odometry_comparison(experiments)
+	_plot_odometry_rms_disturbance_comparison(experiments)
+	_plot_odometry_displacement_norms_comparison(experiments)
+	_plot_sensor_combined_accel_comparison(experiments)
+
+	if save_dir is not None:
+		save_dir.mkdir(parents=True, exist_ok=True)
+		for fig_num in plt.get_fignums():
+			fig = plt.figure(fig_num)
+			out = save_dir / f"comparison_fig{fig_num}.png"
+			fig.savefig(out, dpi=200, bbox_inches="tight")
+
+	if show:
+		plt.show()
+	else:
+		plt.close("all")
+
+
 def main(argv: Optional[List[str]] = None) -> None:
 	"""CLI entry point for offline plotting."""
 	parser = argparse.ArgumentParser(
 		description="Offline plotting for uam_logger_pkg CSV logs"
 	)
-	parser.add_argument("--csv", required=True, help="Path del file CSV generato dal logger")
+	parser.add_argument(
+		"--csv",
+		required=True,
+		nargs="+",
+		help="Path del/dei file CSV generato/i dal logger (uno o piu')",
+	)
+	parser.add_argument(
+		"--labels",
+		default=None,
+		nargs="+",
+		help="Etichette opzionali (una per CSV) usate nelle legende",
+	)
 	parser.add_argument(
 		"--no-show",
 		action="store_true",
@@ -904,15 +1329,21 @@ def main(argv: Optional[List[str]] = None) -> None:
 	)
 	args = parser.parse_args(argv)
 
-	csv_path = Path(args.csv).expanduser()
-	if not csv_path.exists():
-		raise FileNotFoundError(f"CSV non trovato: {csv_path}")
-
+	csv_paths = [Path(p) for p in args.csv]
 	save_dir = Path(args.save_dir).expanduser() if args.save_dir else None
-	run(
-		csv_path=csv_path,
+
+	if len(csv_paths) == 1:
+		csv_path = csv_paths[0].expanduser()
+		if not csv_path.exists():
+			raise FileNotFoundError(f"CSV non trovato: {csv_path}")
+		run(csv_path=csv_path, show=not args.no_show, save_dir=save_dir)
+		return
+
+	run_comparison(
+		csv_paths=[p for p in csv_paths],
 		show=not args.no_show,
 		save_dir=save_dir,
+		labels=args.labels,
 	)
 
 

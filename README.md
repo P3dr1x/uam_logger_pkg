@@ -118,6 +118,21 @@ You can generate plots from a saved CSV using:
 ros2 run uam_logger_pkg uam_logger_offline_plot -- --csv ~/.ros/uam_logger/<your_file>.csv
 ```
 
+Compare multiple experiments on the same figures (overlay):
+
+```bash
+ros2 run uam_logger_pkg uam_logger_offline_plot -- \
+  --csv ~/.ros/uam_logger/expA.csv ~/.ros/uam_logger/expB.csv
+```
+
+Optional custom labels (one per CSV):
+
+```bash
+ros2 run uam_logger_pkg uam_logger_offline_plot -- \
+  --csv ~/.ros/uam_logger/expA.csv ~/.ros/uam_logger/expB.csv \
+  --labels "baseline" "tuned"
+```
+
 Optional: save the figures to PNG files without opening a window:
 
 ```bash
