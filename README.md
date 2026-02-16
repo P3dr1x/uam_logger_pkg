@@ -133,11 +133,12 @@ ros2 run uam_logger_pkg uam_logger_offline_plot -- \
   --labels "baseline" "tuned"
 ```
 
-Optional: save the figures to PNG files without opening a window:
+Optional: save the figures to PNG files without opening a window and print to terminal node parameters in Markdown format:
 
 ```bash
 ros2 run uam_logger_pkg uam_logger_offline_plot -- \
   --csv ~/.ros/uam_logger/<your_file>.csv \
   --save-dir ~/.ros/uam_logger/plots \
-  --no-show
+  --no-show  
+  --print-params-markdown
 ```

@@ -7,6 +7,7 @@ multiple topics over a well-defined time window, then exports the data to CSV.
 from __future__ import annotations
 
 import csv
+import json
 import math
 import os
 from dataclasses import dataclass
@@ -18,6 +19,9 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
+
+from rcl_interfaces.msg import ParameterType
+from rcl_interfaces.srv import GetParameters
 
 from geometry_msgs.msg import Accel, Pose, PoseStamped, Twist
 from nav_msgs.msg import Odometry
@@ -93,6 +97,9 @@ class UamLoggerNode(Node):
 		self.declare_parameter("output_dir", os.path.expanduser("~/.ros/uam_logger"))
 		self.declare_parameter("reference_timeout_sec", 0.5)
 		self.declare_parameter("watchdog_period_sec", 0.05)
+		# Controller param recording
+		self.declare_parameter("controller_node", "/clik_uam_node")
+		self.declare_parameter("controller_param_query_timeout_sec", 2.0)
 		# Downsampling: log 1 sample every N messages (per topic)
 		# Example: 5 -> keep 1 out of 5
 		self.declare_parameter("log_every_n", 5)
@@ -115,6 +122,10 @@ class UamLoggerNode(Node):
 		self.output_dir = Path(str(self.get_parameter("output_dir").value)).expanduser()
 		self.reference_timeout_sec: float = float(self.get_parameter("reference_timeout_sec").value)
 		watchdog_period_sec: float = float(self.get_parameter("watchdog_period_sec").value)
+		self.controller_node: str = str(self.get_parameter("controller_node").value)
+		self.controller_param_query_timeout_sec: float = float(
+			self.get_parameter("controller_param_query_timeout_sec").value
+		)
 		self.log_every_n: int = int(self.get_parameter("log_every_n").value)
 		if self.log_every_n < 1:
 			self.log_every_n = 1
@@ -166,10 +177,189 @@ class UamLoggerNode(Node):
 
 		self._watchdog_timer = self.create_timer(watchdog_period_sec, self._watchdog_tick)
 
+		# Async controller param query state (used in SAVING).
+		self._ctrl_param_client: Optional[Any] = None
+		self._ctrl_param_future: Optional[Any] = None
+		self._ctrl_param_query_started: bool = False
+		self._ctrl_param_query_deadline_ns: Optional[int] = None
+		self._ctrl_param_srv_name: Optional[str] = None
+		self._ctrl_param_candidates: List[str] = []
+		self._ctrl_param_candidate_idx: int = 0
+		self._ctrl_param_name_idx: int = 0
+		self._ctrl_param_values: Dict[str, Any] = {}
+		self._ctrl_param_last_error: Optional[str] = None
+		self._ctrl_param_names: List[str] = [
+			"k_com_vel",
+			"k_damp",
+			"k_err_pos_",
+			"k_err_vel_",
+			"redundant",
+			"w_com",
+			"w_damp",
+			"w_dyn",
+			"w_kin",
+			"w_mom",
+			"k_err",
+		]
+		self._pending_save_t_zero_ns: Optional[int] = None
+
 		self.get_logger().info(
 			f"UAM logger ready (use_sim_time={self.get_parameter('use_sim_time').value}). "
 			f"Trigger: {self.topic_desired_ee_accel} / {self.topic_desired_ee_vel} / {self.topic_desired_ee_pose}"
 		)
+
+	def _controller_get_parameters_service(self) -> str:
+		controller = (self.controller_node or "").strip()
+		if not controller:
+			controller = "/clik_uam_node"
+		if not controller.startswith("/"):
+			controller = "/" + controller
+		controller = controller.rstrip("/")
+		return f"{controller}/get_parameters"
+
+	def _discover_controller_param_services(self) -> List[str]:
+		"""Return candidate /<node>/get_parameters service names for clik_uam_node.
+
+		This helps when the controller is launched under a namespace.
+		"""
+		candidates: List[str] = []
+		try:
+			names_and_ns = self.get_node_names_and_namespaces()
+		except Exception:
+			return candidates
+
+		for name, ns in names_and_ns:
+			if name != "clik_uam_node":
+				continue
+			ns_s = (ns or "").rstrip("/")
+			full = f"{ns_s}/{name}" if ns_s else f"/{name}"
+			full = full if full.startswith("/") else "/" + full
+			candidates.append(f"{full}/get_parameters")
+		return candidates
+
+	def _parameter_value_to_python(self, value_msg: Any) -> Any:
+		"""Convert rcl_interfaces/msg/ParameterValue to a plain Python value."""
+		ptype = int(getattr(value_msg, "type", ParameterType.PARAMETER_NOT_SET))
+		if ptype == ParameterType.PARAMETER_NOT_SET:
+			return None
+		if ptype == ParameterType.PARAMETER_BOOL:
+			return bool(value_msg.bool_value)
+		if ptype == ParameterType.PARAMETER_INTEGER:
+			return int(value_msg.integer_value)
+		if ptype == ParameterType.PARAMETER_DOUBLE:
+			return float(value_msg.double_value)
+		if ptype == ParameterType.PARAMETER_STRING:
+			return str(value_msg.string_value)
+		# Not expected for our controller params; keep it explicit.
+		return None
+
+	def _fetch_controller_parameters(self) -> Tuple[Dict[str, Any], Optional[str]]:
+		"""Fetch selected parameters from the controller node via GetParameters.
+
+		Returns:
+			(params_dict, error_str)
+		"""
+		# NOTE: This method used to block using spin_until_future_complete().
+		# It is kept for backward compatibility but is NOT used by the logger
+		# state machine anymore (to avoid deadlocks when called inside callbacks).
+		return {}, "disabled_blocking_fetch"
+
+	def _reset_controller_param_query_state(self) -> None:
+		self._ctrl_param_client = None
+		self._ctrl_param_future = None
+		self._ctrl_param_query_started = False
+		self._ctrl_param_query_deadline_ns = None
+		self._ctrl_param_srv_name = None
+		self._ctrl_param_candidates = []
+		self._ctrl_param_candidate_idx = 0
+		self._ctrl_param_name_idx = 0
+		self._ctrl_param_values = {}
+		self._ctrl_param_last_error = None
+
+	def _begin_controller_param_query(self, now_ns: int) -> None:
+		self._reset_controller_param_query_state()
+		# Build candidate list:
+		# 1) configured controller_node
+		# 2) autodetected nodes named clik_uam_node (namespaces)
+		configured = self._controller_get_parameters_service()
+		discovered = self._discover_controller_param_services()
+		cands: List[str] = [configured] + [s for s in discovered if s != configured]
+		self._ctrl_param_candidates = cands
+		self._ctrl_param_candidate_idx = 0
+		if self._ctrl_param_candidates:
+			srv_name = self._ctrl_param_candidates[0]
+			self._ctrl_param_srv_name = srv_name
+			self._ctrl_param_client = self.create_client(GetParameters, srv_name)
+		self._ctrl_param_name_idx = 0
+		self._ctrl_param_values = {}
+		self._ctrl_param_last_error = None
+		timeout = max(0.0, float(self.controller_param_query_timeout_sec))
+		self._ctrl_param_query_deadline_ns = now_ns + int(timeout * 1e9)
+
+	def _advance_controller_param_candidate(self) -> bool:
+		"""Move to next candidate service. Returns True if advanced."""
+		if self._ctrl_param_candidate_idx + 1 >= len(self._ctrl_param_candidates):
+			return False
+		self._ctrl_param_candidate_idx += 1
+		srv_name = self._ctrl_param_candidates[self._ctrl_param_candidate_idx]
+		self._ctrl_param_srv_name = srv_name
+		self._ctrl_param_client = self.create_client(GetParameters, srv_name)
+		self._ctrl_param_future = None
+		self._ctrl_param_query_started = False
+		self._ctrl_param_name_idx = 0
+		self._ctrl_param_values = {}
+		self._ctrl_param_last_error = None
+		return True
+
+	def _try_start_controller_param_query(self) -> bool:
+		# This starts (or restarts) a single-parameter GetParameters call.
+		if self._ctrl_param_query_started:
+			return True
+		if self._ctrl_param_client is None:
+			return False
+		if self._ctrl_param_name_idx >= len(self._ctrl_param_names):
+			return True
+		# Non-blocking availability check.
+		try:
+			ready = bool(self._ctrl_param_client.wait_for_service(timeout_sec=0.0))
+		except Exception:
+			ready = False
+		if not ready:
+			return False
+
+		req = GetParameters.Request()
+		req.names = [self._ctrl_param_names[self._ctrl_param_name_idx]]
+		self._ctrl_param_future = self._ctrl_param_client.call_async(req)
+		self._ctrl_param_query_started = True
+		return True
+
+	def _consume_single_param_future(self) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
+		"""Return (name, value, err) for the current in-flight single-param request."""
+		if self._ctrl_param_future is None:
+			return None, None, "no_future"
+		if not self._ctrl_param_future.done():
+			return None, None, "future_not_done"
+		if self._ctrl_param_future.exception() is not None:
+			return None, None, f"service_exception: {self._ctrl_param_future.exception()}"
+		if self._ctrl_param_name_idx >= len(self._ctrl_param_names):
+			return None, None, "name_idx_out_of_range"
+		name = self._ctrl_param_names[self._ctrl_param_name_idx]
+
+		resp = self._ctrl_param_future.result()
+		if resp is None:
+			return name, None, "empty_response"
+		values = getattr(resp, "values", None)
+		if values is None:
+			return name, None, "malformed_response"
+		# Per specifica ROS2, values dovrebbe avere la stessa lunghezza di req.names.
+		# In pratica, alcuni nodi/implementazioni possono rispondere con lista vuota
+		# quando il parametro non esiste/non è dichiarato. In tal caso, trattiamo il
+		# valore come "non disponibile" (None) e continuiamo a loggare gli altri.
+		if len(values) == 0:
+			return name, None, None
+		if len(values) != 1:
+			return name, None, f"unexpected_values_len: {len(values)} != 1"
+		return name, self._parameter_value_to_python(values[0]), None
 
 	def _now_ns(self) -> int:
 		return int(self.get_clock().now().nanoseconds)
@@ -430,21 +620,62 @@ class UamLoggerNode(Node):
 
 	# ---------------------------- State logic ----------------------------
 	def _watchdog_tick(self) -> None:
-		if self.state != LoggerState.RECORDING:
-			return
-		if self._last_reference_ns is None:
-			return
-
 		now_ns = self._now_ns()
-		dt = (now_ns - self._last_reference_ns) / 1e9
-		if dt <= self.reference_timeout_sec:
+
+		if self.state == LoggerState.RECORDING:
+			if self._last_reference_ns is None:
+				return
+
+			dt = (now_ns - self._last_reference_ns) / 1e9
+			if dt <= self.reference_timeout_sec:
+				return
+
+			# Transition to SAVING. Do not block here.
+			self.state = LoggerState.SAVING
+			self._pending_save_t_zero_ns = self._select_time_zero_ns()
+			self._begin_controller_param_query(now_ns)
 			return
 
-		self.state = LoggerState.SAVING
-		try:
-			self._save_experiment()
-		finally:
-			self._reset_to_idle()
+		if self.state != LoggerState.SAVING:
+			return
+
+		# In SAVING: try starting the param query (service might come up late).
+		if (self._ctrl_param_client is None) and self._ctrl_param_candidates:
+			# Defensive: ensure a client exists.
+			srv_name = self._ctrl_param_candidates[self._ctrl_param_candidate_idx]
+			self._ctrl_param_srv_name = srv_name
+			self._ctrl_param_client = self.create_client(GetParameters, srv_name)
+		if not self._ctrl_param_query_started:
+			self._try_start_controller_param_query()
+
+		deadline_ns = self._ctrl_param_query_deadline_ns
+		timed_out = (deadline_ns is not None) and (now_ns >= deadline_ns)
+		future_done = (self._ctrl_param_future is not None) and bool(self._ctrl_param_future.done())
+
+		if future_done:
+			name, val, err = self._consume_single_param_future()
+			if err is None and name is not None:
+				self._ctrl_param_values[name] = val
+				self._ctrl_param_name_idx += 1
+				# Start next parameter immediately (non-blocking).
+				self._ctrl_param_future = None
+				self._ctrl_param_query_started = False
+				if self._ctrl_param_name_idx < len(self._ctrl_param_names):
+					self._try_start_controller_param_query()
+			else:
+				self._ctrl_param_last_error = err
+				# If response is unusable, try next candidate service (if any).
+				if err is not None and err.startswith("unexpected_values_len"):
+					if self._advance_controller_param_candidate():
+						self._try_start_controller_param_query()
+
+		all_done = self._ctrl_param_name_idx >= len(self._ctrl_param_names)
+		if not (all_done or timed_out):
+			return
+
+		# Finalize save with either params or error.
+		self._save_experiment()
+		self._reset_to_idle()
 
 	def _reset_to_idle(self) -> None:
 		self.state = LoggerState.IDLE
@@ -453,6 +684,8 @@ class UamLoggerNode(Node):
 		self._t_first_desired_vel_ns = None
 		self._last_reference_ns = None
 		self._topic_msg_counts = {}
+		self._pending_save_t_zero_ns = None
+		self._reset_controller_param_query_state()
 		self.get_logger().info("IDLE")
 
 	def _select_time_zero_ns(self) -> Optional[int]:
@@ -462,13 +695,37 @@ class UamLoggerNode(Node):
 		return self._t_trigger_start_ns
 
 	def _save_experiment(self) -> None:
-		t_zero_ns = self._select_time_zero_ns()
+		t_zero_ns = self._pending_save_t_zero_ns if self._pending_save_t_zero_ns is not None else self._select_time_zero_ns()
 		if t_zero_ns is None:
 			self.get_logger().warn("Nessun t0 disponibile: niente da salvare")
 			return
 		if not self._rows:
 			self.get_logger().warn("Buffer vuoto: niente da salvare")
 			return
+
+		# --- Parameter recording (controller) ---
+		ctrl_params: Dict[str, Any] = dict(self._ctrl_param_values)
+		ctrl_err: Optional[str]
+		if self._ctrl_param_name_idx >= len(self._ctrl_param_names):
+			ctrl_err = self._ctrl_param_last_error
+		else:
+			srv_name = self._ctrl_param_srv_name or self._controller_get_parameters_service()
+			ctrl_err = self._ctrl_param_last_error or f"timeout_calling_service: {srv_name}"
+		metadata_fields: Dict[str, Any] = {
+			"controller_node": self.controller_node,
+			"controller_params_service": self._ctrl_param_srv_name,
+			"controller_params_json": json.dumps(ctrl_params, sort_keys=True),
+			"controller_params_error": ctrl_err,
+		}
+		# Put metadata first in the CSV for easy inspection.
+		self._rows.insert(
+			0,
+			LogRow(
+				t_ns=t_zero_ns,
+				topic="__metadata__/controller_params",
+				fields=metadata_fields,
+			),
+		)
 
 		self.output_dir.mkdir(parents=True, exist_ok=True)
 		stamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")

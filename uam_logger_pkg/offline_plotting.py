@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,6 +110,9 @@ class ExperimentData:
 
 	accel: Optional[AccelSeries]
 	gyro: Optional[GyroSeries]
+
+	# Controller parameters (metadata) if available in the CSV.
+	controller_params: Optional[Dict[str, object]]
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -301,6 +305,125 @@ def _compute_pose_tracking_errors(
 	return err_t, pos_err_norm, ori_err_norm_deg
 
 
+def _controller_param_order() -> List[str]:
+	"""Preferred row order for controller param comparison tables."""
+	return [
+		"k_com_vel",
+		"k_damp",
+		"k_err_pos_",
+		"k_err_vel_",
+		"redundant",
+		"w_com",
+		"w_damp",
+		"w_dyn",
+		"w_kin",
+		"w_mom",
+		"k_err",
+	]
+
+
+def _extract_controller_params(groups: Dict[str, List[Dict[str, str]]]) -> Optional[Dict[str, object]]:
+	rows = groups.get("__metadata__/controller_params", [])
+	if not rows:
+		return None
+
+	r = rows[0]
+	raw = (r.get("controller_params_json") or "").strip()
+	if not raw:
+		return None
+	try:
+		obj = json.loads(raw)
+		if isinstance(obj, dict):
+			return obj  # type: ignore[return-value]
+	except Exception:
+		return None
+	return None
+
+
+def _format_controller_params_markdown(experiments: Sequence[ExperimentData]) -> Optional[str]:
+	"""Return a Markdown table (rows=params, cols=experiments) or None if empty."""
+	all_params = set()
+	for e in experiments:
+		if e.controller_params is not None:
+			all_params.update(e.controller_params.keys())
+
+	if not all_params:
+		return None
+
+	ordered = []
+	for p in _controller_param_order():
+		if p in all_params:
+			ordered.append(p)
+	for p in sorted(all_params):
+		if p not in ordered:
+			ordered.append(p)
+
+	col_labels = [e.label for e in experiments]
+	# Header
+	lines: List[str] = []
+	lines.append("| param | " + " | ".join(col_labels) + " |")
+	lines.append("|---|" + "|".join(["---"] * len(col_labels)) + "|")
+
+	for p in ordered:
+		row_vals: List[str] = []
+		for e in experiments:
+			val = None
+			if e.controller_params is not None:
+				val = e.controller_params.get(p)
+			row_vals.append("" if val is None else str(val))
+		lines.append("| " + p + " | " + " | ".join(row_vals) + " |")
+
+	return "\n".join(lines)
+
+
+def _plot_controller_params_table(experiments: Sequence[ExperimentData]) -> None:
+	"""Show a separate window with controller parameters table."""
+	import matplotlib.pyplot as plt
+
+	all_params = set()
+	for e in experiments:
+		if e.controller_params is not None:
+			all_params.update(e.controller_params.keys())
+	if not all_params:
+		return
+
+	ordered: List[str] = []
+	for p in _controller_param_order():
+		if p in all_params:
+			ordered.append(p)
+	for p in sorted(all_params):
+		if p not in ordered:
+			ordered.append(p)
+
+	col_labels = [e.label for e in experiments]
+	cell_text: List[List[str]] = []
+	for p in ordered:
+		row: List[str] = []
+		for e in experiments:
+			val = None
+			if e.controller_params is not None:
+				val = e.controller_params.get(p)
+			row.append("" if val is None else str(val))
+		cell_text.append(row)
+
+	# Heuristic sizing for readability.
+	width = max(8.0, 1.8 * len(experiments))
+	height = max(3.0, 0.35 * len(ordered) + 1.5)
+	fig, ax = plt.subplots(figsize=(width, height))
+	fig.suptitle("Controller parameters (from CSV metadata)")
+	ax.axis("off")
+
+	table = ax.table(
+		cellText=cell_text,
+		rowLabels=ordered,
+		colLabels=col_labels,
+		loc="center",
+	)
+	table.auto_set_font_size(False)
+	table.set_fontsize(9)
+	table.scale(1.0, 1.2)
+
+
 def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 	groups = _load_csv_grouped(csv_path)
 
@@ -318,6 +441,7 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
+	controller_params = _extract_controller_params(groups)
 
 	return ExperimentData(
 		label=label,
@@ -328,6 +452,7 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 		odom=odom,
 		accel=accel,
 		gyro=gyro,
+		controller_params=controller_params,
 	)
 
 
@@ -1250,6 +1375,7 @@ def run_comparison(
 	show: bool,
 	save_dir: Optional[Path],
 	labels: Optional[Sequence[str]] = None,
+	print_params_markdown: bool = False,
 ) -> None:
 	"""Generate comparison plots from multiple CSV files.
 
@@ -1280,12 +1406,17 @@ def run_comparison(
 		label = labels[i] if labels is not None else p.stem
 		experiments.append(_load_experiment(p, label=label))
 
+	md = _format_controller_params_markdown(experiments)
+	if print_params_markdown and md is not None:
+		print(md)
+
 	_plot_ee_trajectories_comparison(experiments)
 	_plot_pose_error_norm_comparison(experiments)
 	_plot_odometry_comparison(experiments)
 	_plot_odometry_rms_disturbance_comparison(experiments)
 	_plot_odometry_displacement_norms_comparison(experiments)
 	_plot_sensor_combined_accel_comparison(experiments)
+	_plot_controller_params_table(experiments)
 
 	if save_dir is not None:
 		save_dir.mkdir(parents=True, exist_ok=True)
@@ -1327,6 +1458,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 		default=None,
 		help="Directory dove salvare i PNG (opzionale). Se non specificato, non salva su disco.",
 	)
+	parser.add_argument(
+		"--print-params-markdown",
+		action="store_true",
+		help="Stampa su terminale una tabella Markdown dei parametri controller trovati nel CSV (default: false)",
+	)
 	args = parser.parse_args(argv)
 
 	csv_paths = [Path(p) for p in args.csv]
@@ -1337,6 +1473,11 @@ def main(argv: Optional[List[str]] = None) -> None:
 		if not csv_path.exists():
 			raise FileNotFoundError(f"CSV non trovato: {csv_path}")
 		run(csv_path=csv_path, show=not args.no_show, save_dir=save_dir)
+		if args.print_params_markdown:
+			exp = _load_experiment(csv_path, label=csv_path.stem)
+			md = _format_controller_params_markdown([exp])
+			if md is not None:
+				print(md)
 		return
 
 	run_comparison(
@@ -1344,6 +1485,7 @@ def main(argv: Optional[List[str]] = None) -> None:
 		show=not args.no_show,
 		save_dir=save_dir,
 		labels=args.labels,
+		print_params_markdown=args.print_params_markdown,
 	)
 
 
