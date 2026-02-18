@@ -71,6 +71,7 @@ Launch (recommended, enables sim time by default):
 
 ```bash
 ros2 launch uam_logger_pkg uam_logger.launch.py 
+	use_sim_time:=true \
   experiment_name:=sitl_test 
   output_dir:=~/.ros/uam_logger 
 	log_every_n:=5 
@@ -104,6 +105,7 @@ Topic remapping via parameters (advanced):
 
 > [!NOTE]
 > - For SITL, keep `use_sim_time=true` so timestamps follow the simulator clock.
+> - On real system, set `use_sim_time:=false` unless you are publishing `/clock`; otherwise ROS time may not advance and the logger may never trigger the timeout/save.
 >- `px4_msgs` might not be available in every environment; in that case the node will warn and skip `/fmu/out/sensor_combined`.
 
 ## Offline plotting

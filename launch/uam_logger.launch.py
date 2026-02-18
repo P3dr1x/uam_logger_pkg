@@ -7,6 +7,11 @@ from launch_ros.actions import Node
 
 
 def generate_launch_description() -> LaunchDescription:
+	use_sim_time_arg = DeclareLaunchArgument(
+		"use_sim_time",
+		default_value="true",
+		description="Use simulation time (requires /clock). Set false on real system.",
+	)
 	experiment_name_arg = DeclareLaunchArgument(
 		"experiment_name",
 		default_value="experiment",
@@ -34,7 +39,7 @@ def generate_launch_description() -> LaunchDescription:
 		name="uam_logger_node",
 		output="screen",
 		parameters=[
-			{"use_sim_time": True},
+			{"use_sim_time": LaunchConfiguration("use_sim_time")},
 			{"experiment_name": LaunchConfiguration("experiment_name")},
 			{"log_every_n": LaunchConfiguration("log_every_n")},
 			{"output_dir": LaunchConfiguration("output_dir")},
@@ -43,6 +48,7 @@ def generate_launch_description() -> LaunchDescription:
 	)
 
 	return LaunchDescription([
+		use_sim_time_arg,
 		experiment_name_arg,
 		log_every_n_arg,
 		output_dir_arg,
