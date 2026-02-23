@@ -779,7 +779,20 @@ def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: s
 	fig, axs = plt.subplots(2, 1, sharex=True)
 	fig.suptitle(f"{title_prefix} - EE Pose tracking errors")
 
-	axs[0].plot(err_t, pos_err_norm, color="red")
+	(line_pos,) = axs[0].plot(err_t, pos_err_norm, color="red")
+	pos_mean = sum(pos_err_norm) / float(len(pos_err_norm))
+	axs[0].axhline(pos_mean, linestyle="--", color=line_pos.get_color(), label="_nolegend_")
+	axs[0].annotate(
+		rf"$\mathbf{{\overline{{\|e_p\|}}={pos_mean:.3f}}}$",
+		xy=(0.99, pos_mean),
+		xycoords=axs[0].get_yaxis_transform(),
+		textcoords="offset points",
+		xytext=(0, 4),
+		ha="right",
+		va="bottom",
+		color=line_pos.get_color(),
+		fontweight="bold",
+	)
 	axs[0].grid(True)
 	axs[0].set_ylabel(r"$\|\|e_p\|\|\;[m]$")
 
@@ -1064,7 +1077,7 @@ def _plot_pose_error_norm_comparison(experiments: Sequence[ExperimentData]) -> N
 	fig, axs = plt.subplots(2, 1, sharex=True)
 	fig.suptitle("EE Pose tracking errors (comparison)")
 
-	for exp in usable:
+	for i, exp in enumerate(usable):
 		desired = exp.desired_pose
 		real = exp.real_pose
 		assert desired is not None
@@ -1072,7 +1085,25 @@ def _plot_pose_error_norm_comparison(experiments: Sequence[ExperimentData]) -> N
 		err_t, pos_err, ori_err_deg = _compute_pose_tracking_errors(desired, real)
 		if not err_t:
 			continue
-		axs[0].plot(err_t, pos_err, label=exp.label)
+		(line_pos,) = axs[0].plot(err_t, pos_err, label=exp.label)
+		pos_mean = sum(pos_err) / float(len(pos_err))
+		axs[0].axhline(
+			pos_mean,
+			linestyle="--",
+			color=line_pos.get_color(),
+			label="_nolegend_",
+		)
+		axs[0].annotate(
+			rf"$\mathbf{{\overline{{\|e_p\|}}={pos_mean:.3f}}}$",
+			xy=(0.99, pos_mean),
+			xycoords=axs[0].get_yaxis_transform(),
+			textcoords="offset points",
+			xytext=(0, 4 + 10 * (i % 8)),
+			ha="right",
+			va="bottom",
+			color=line_pos.get_color(),
+			fontweight="bold",
+		)
 		axs[1].plot(err_t, ori_err_deg, label=exp.label)
 
 	for ax in axs:
@@ -1184,7 +1215,7 @@ def _plot_odometry_rms_disturbance_comparison(experiments: Sequence[ExperimentDa
 	fig, ax = plt.subplots()
 	fig.suptitle("Drone attitude disturbance (RMS, comparison)")
 
-	for exp in usable:
+	for i, exp in enumerate(usable):
 		odom = exp.odom
 		assert odom is not None
 		r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
@@ -1196,7 +1227,25 @@ def _plot_odometry_rms_disturbance_comparison(experiments: Sequence[ExperimentDa
 		for dr, dp, dy in zip(droll, dpitch, dyaw):
 			rms.append(math.sqrt((dr * dr + dp * dp + dy * dy) / 3.0))
 
-		ax.plot(odom.t, rms, label=exp.label)
+		(line_rms,) = ax.plot(odom.t, rms, label=exp.label)
+		rms_mean = sum(rms) / float(len(rms))
+		ax.axhline(
+			rms_mean,
+			linestyle="--",
+			color=line_rms.get_color(),
+			label="_nolegend_",
+		)
+		ax.annotate(
+			rf"$\mathbf{{\overline{{\delta}}_{{RMS}}={rms_mean:.2f}}}$",
+			xy=(0.99, rms_mean),
+			xycoords=ax.get_yaxis_transform(),
+			textcoords="offset points",
+			xytext=(0, 4 + 10 * (i % 8)),
+			ha="right",
+			va="bottom",
+			color=line_rms.get_color(),
+			fontweight="bold",
+		)
 
 	ax.grid(True)
 	ax.set_xlabel("t [s]")
@@ -1352,12 +1401,25 @@ def _plot_odometry_rms_disturbance(odom: OdomSeries, title_prefix: str) -> None:
 	for dr, dp, dy in zip(droll, dpitch, dyaw):
 		rms.append(math.sqrt((dr * dr + dp * dp + dy * dy) / 3.0))
 
-	plt.figure()
-	plt.plot(odom.t, rms, color="purple")
-	plt.grid(True)
-	plt.title(f"{title_prefix} - $\\delta_{{RMS}}$ disturbance (attitude)")
-	plt.xlabel("t [s]")
-	plt.ylabel(r"$\delta_{RMS}$ [°]")
+	fig, ax = plt.subplots()
+	(ax_line,) = ax.plot(odom.t, rms, color="purple")
+	rms_mean = sum(rms) / float(len(rms))
+	ax.axhline(rms_mean, linestyle="--", color=ax_line.get_color(), label="_nolegend_")
+	ax.annotate(
+		rf"$\mathbf{{\overline{{\delta}}_{{RMS}}={rms_mean:.2f}}}$",
+		xy=(0.99, rms_mean),
+		xycoords=ax.get_yaxis_transform(),
+		textcoords="offset points",
+		xytext=(0, 4),
+		ha="right",
+		va="bottom",
+		color=ax_line.get_color(),
+		fontweight="bold",
+	)
+	ax.grid(True)
+	ax.set_title(f"{title_prefix} - $\\delta_{{RMS}}$ disturbance (attitude)")
+	ax.set_xlabel("t [s]")
+	ax.set_ylabel(r"$\delta_{RMS}$ [°]")
 
 
 def _plot_sensor_combined_imu(
