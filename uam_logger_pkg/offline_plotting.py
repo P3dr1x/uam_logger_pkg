@@ -798,33 +798,109 @@ def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> N
 	"""
 	import matplotlib.pyplot as plt
 
-	usable = [e for e in experiments if e.desired_pose is not None and e.real_pose is not None]
-	if not usable:
-		return
+	def _vec_cross(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> Tuple[float, float, float]:
+		ax, ay, az = a
+		bx, by, bz = b
+		return (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx)
 
-	def _rotate_about_z(x: float, y: float, yaw: float) -> Tuple[float, float]:
-		c = math.cos(yaw)
-		s = math.sin(yaw)
-		xr = c * x - s * y
-		yr = s * x + c * y
-		return xr, yr
+	def _vec_dot(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
+		return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
 
-	def _estimate_yaw_to_match_reference(
-		ref_x: List[float],
-		ref_y: List[float],
-		x: List[float],
-		y: List[float],
-	) -> float:
-		"""Return yaw (rad) that best aligns (x,y) to (ref_x,ref_y) in least squares.
+	def _vec_norm(a: Tuple[float, float, float]) -> float:
+		return math.sqrt(_vec_dot(a, a))
 
-		Both trajectories are assumed already translated so they start at the origin.
-		The result is a rotation about +Z applied to (x,y).
+	def _vec_scale(a: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
+		return (a[0] * s, a[1] * s, a[2] * s)
+
+	def _vec_sub(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> Tuple[float, float, float]:
+		return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+	def _mat_mul_vec(m: List[List[float]], v: Tuple[float, float, float]) -> Tuple[float, float, float]:
+		return (
+			m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+			m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+			m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+		)
+
+	def _rotation_matrix_from_axis_angle(axis: Tuple[float, float, float], angle: float) -> List[List[float]]:
+		"""Rodrigues' rotation formula."""
+		ax, ay, az = axis
+		c = math.cos(angle)
+		s = math.sin(angle)
+		v = 1.0 - c
+		return [
+			[c + ax * ax * v, ax * ay * v - az * s, ax * az * v + ay * s],
+			[ay * ax * v + az * s, c + ay * ay * v, ay * az * v - ax * s],
+			[az * ax * v - ay * s, az * ay * v + ax * s, c + az * az * v],
+		]
+
+	def _estimate_plane_normal(points: List[Tuple[float, float, float]]) -> Tuple[float, float, float]:
+		"""Estimate trajectory plane normal via accumulated triangle areas.
+
+		This is robust for planar loops (circles/rectangles) and avoids heavy deps.
 		"""
-		m = min(len(ref_x), len(x), len(ref_y), len(y))
+		if len(points) < 3:
+			return (0.0, 1.0, 0.0)
+		p0 = points[0]
+		nx = ny = nz = 0.0
+		for i in range(1, len(points) - 1):
+			v1 = _vec_sub(points[i], p0)
+			v2 = _vec_sub(points[i + 1], p0)
+			cx, cy, cz = _vec_cross(v1, v2)
+			nx += cx
+			ny += cy
+			nz += cz
+		n = (nx, ny, nz)
+		nn = _vec_norm(n)
+		if nn < 1e-12:
+			return (0.0, 1.0, 0.0)
+		return _vec_scale(n, 1.0 / nn)
+
+	def _rotation_to_align_vector(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> List[List[float]]:
+		"""Return rotation matrix R such that R*a is aligned with b."""
+		an = _vec_norm(a)
+		bn = _vec_norm(b)
+		if an < 1e-12 or bn < 1e-12:
+			return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+		a_u = _vec_scale(a, 1.0 / an)
+		b_u = _vec_scale(b, 1.0 / bn)
+		# Force deterministic sign when both are almost collinear.
+		d = _clamp(_vec_dot(a_u, b_u), -1.0, 1.0)
+		if d > 1.0 - 1e-10:
+			return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+		if d < -1.0 + 1e-10:
+			# 180deg rotation around X maps -Y to +Y, and is stable.
+			return [[1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, -1.0]]
+
+		axis = _vec_cross(a_u, b_u)
+		axis_n = _vec_norm(axis)
+		if axis_n < 1e-12:
+			return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+		axis_u = _vec_scale(axis, 1.0 / axis_n)
+		angle = math.atan2(axis_n, d)
+		return _rotation_matrix_from_axis_angle(axis_u, angle)
+
+	def _rotate_about_y(x: float, y: float, z: float, theta: float) -> Tuple[float, float, float]:
+		c = math.cos(theta)
+		s = math.sin(theta)
+		xr = c * x + s * z
+		zr = -s * x + c * z
+		return xr, y, zr
+
+	def _estimate_rot_y_to_match_reference(
+		ref_x: List[float],
+		ref_z: List[float],
+		x: List[float],
+		z: List[float],
+	) -> float:
+		"""Return theta (rad) to best align (x,z) to (ref_x,ref_z) by rot about +Y.
+
+		All trajectories are assumed translated so they start at the origin.
+		"""
+		m = min(len(ref_x), len(ref_z), len(x), len(z))
 		if m < 2:
 			return 0.0
 
-		# Use a uniform subsampling to avoid overweighting very dense logs.
 		max_points = 300
 		step = max(1, m // max_points)
 
@@ -834,35 +910,51 @@ def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> N
 		energy_cur = 0.0
 		for i in range(0, m, step):
 			cx = x[i]
-			cy = y[i]
+			cz = z[i]
 			rx = ref_x[i]
-			ry_ref = ref_y[i]
-			# a = sum(c · r)
-			a += cx * rx + cy * ry_ref
-			# b = sum(c_x r_y - c_y r_x)
-			b += cx * ry_ref - cy * rx
-			energy_ref += rx * rx + ry_ref * ry_ref
-			energy_cur += cx * cx + cy * cy
-
+			rz = ref_z[i]
+			# maximize c*a + s*b where dot after rotY is:
+			# v · (R_y(theta) u) = c*(rx*cx + rz*cz) + s*(rx*cz - rz*cx)
+			a += rx * cx + rz * cz
+			b += rx * cz - rz * cx
+			energy_ref += rx * rx + rz * rz
+			energy_cur += cx * cx + cz * cz
 		if energy_ref < 1e-12 or energy_cur < 1e-12:
 			return 0.0
 		return math.atan2(b, a)
 
+	usable = [e for e in experiments if e.desired_pose is not None and e.real_pose is not None]
+	if not usable:
+		return
+
 	fig = plt.figure()
 	ax = fig.add_subplot(111, projection="3d")
 	fig.suptitle(
-		"End-effector trajectories (comparison, translated + yaw-aligned desired)"
+		"End-effector trajectories (comparison, translated + plane-aligned desired)"
 	)
 
-	# Build reference (first usable experiment) desired trajectory, translated to start.
+	# Build reference desired trajectory in the plotting frame:
+	# - translated so start at origin
+	# - rotated so that its best-fit plane becomes the X-Z plane (y=0)
+	# - projected on X-Z plane for visualization
 	ref_exp = usable[0]
 	ref_desired = ref_exp.desired_pose
 	assert ref_desired is not None
 	ref_x0, ref_y0, ref_z0 = ref_desired.px[0], ref_desired.py[0], ref_desired.pz[0]
-	ref_dx = [x - ref_x0 for x in ref_desired.px]
-	ref_dy = [y - ref_y0 for y in ref_desired.py]
+	ref_pts = [(x - ref_x0, y - ref_y0, z - ref_z0) for x, y, z in zip(ref_desired.px, ref_desired.py, ref_desired.pz)]
+	# Ensure consistent normal sign (prefer +Y)
+	ref_n = _estimate_plane_normal(ref_pts)
+	if ref_n[1] < 0.0:
+		ref_n = _vec_scale(ref_n, -1.0)
+	ref_R = _rotation_to_align_vector(ref_n, (0.0, 1.0, 0.0))
+	ref_rot = [_mat_mul_vec(ref_R, p) for p in ref_pts]
+	ref_dx = [p[0] for p in ref_rot]
+	ref_dz = [p[2] for p in ref_rot]
 
 	colors = plt.get_cmap("tab10")
+	x_all: List[float] = []
+	y_all: List[float] = []
+	z_all: List[float] = []
 	for i, exp in enumerate(usable):
 		desired = exp.desired_pose
 		real = exp.real_pose
@@ -870,36 +962,58 @@ def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> N
 		assert real is not None
 
 		x0, y0, z0 = desired.px[0], desired.py[0], desired.pz[0]
-		dx = [x - x0 for x in desired.px]
-		dy = [y - y0 for y in desired.py]
-		dz = [z - z0 for z in desired.pz]
-		rx = [x - x0 for x in real.px]
-		ry_ = [y - y0 for y in real.py]
-		rz = [z - z0 for z in real.pz]
+		pts_d = [(x - x0, y - y0, z - z0) for x, y, z in zip(desired.px, desired.py, desired.pz)]
+		pts_r = [(x - x0, y - y0, z - z0) for x, y, z in zip(real.px, real.py, real.pz)]
 
-		# Estimate yaw offset so that the desired trajectory aligns to the reference desired.
-		# This makes identical desired trajectories overlap even if experiments started
-		# from different vehicle yaw orientations.
-		yaw_align = 0.0 if exp is ref_exp else _estimate_yaw_to_match_reference(ref_dx, ref_dy, dx, dy)
-		if yaw_align != 0.0:
+		# Rotate so the desired trajectory plane becomes X-Z (y=0).
+		n = _estimate_plane_normal(pts_d)
+		if n[1] < 0.0:
+			n = _vec_scale(n, -1.0)
+		R = _rotation_to_align_vector(n, (0.0, 1.0, 0.0))
+		pts_d = [_mat_mul_vec(R, p) for p in pts_d]
+		pts_r = [_mat_mul_vec(R, p) for p in pts_r]
+
+		dx = [p[0] for p in pts_d]
+		dy = [p[1] for p in pts_d]
+		dz = [p[2] for p in pts_d]
+		rx = [p[0] for p in pts_r]
+		ry_ = [p[1] for p in pts_r]
+		rz = [p[2] for p in pts_r]
+
+		# Further align in-plane (rotation about +Y) to overlap identical desired trajectories.
+		theta = 0.0 if exp is ref_exp else _estimate_rot_y_to_match_reference(ref_dx, ref_dz, dx, dz)
+		if theta != 0.0:
 			dx_r: List[float] = []
-			dy_r: List[float] = []
+			dz_r: List[float] = []
 			rx_r: List[float] = []
 			ry_r: List[float] = []
-			for xx, yy in zip(dx, dy):
-				xr, yr = _rotate_about_z(xx, yy, yaw_align)
+			rz_r: List[float] = []
+			for xx, yy, zz in zip(dx, dy, dz):
+				xr, yr, zr = _rotate_about_y(xx, yy, zz, theta)
 				dx_r.append(xr)
-				dy_r.append(yr)
-			for xx, yy in zip(rx, ry_):
-				xr, yr = _rotate_about_z(xx, yy, yaw_align)
+				dz_r.append(zr)
+			for xx, yy, zz in zip(rx, ry_, rz):
+				xr, yr, zr = _rotate_about_y(xx, yy, zz, theta)
 				rx_r.append(xr)
 				ry_r.append(yr)
-			dx, dy = dx_r, dy_r
-			rx, ry_ = rx_r, ry_r
+				rz_r.append(zr)
+			dx, dz = dx_r, dz_r
+			rx, ry_, rz = rx_r, ry_r, rz_r
+			# dy is already close to 0; keep it for completeness
+
+		# Force desired to lie exactly on X-Z plane for visualization.
+		dy = [0.0 for _ in dx]
 
 		color = colors(i % 10)
-		ax.plot(dx, dy, dz, linestyle="--", color=color, alpha=0.7, label=f"{exp.label} desired")
+		ax.plot(dx, dy, dz, linestyle="--", color="lime", alpha=0.9, label=f"{exp.label} desired")
 		ax.plot(rx, ry_, rz, linestyle="-", color=color, alpha=1.0, label=f"{exp.label} real")
+
+		y_all.extend(dy)
+		y_all.extend(ry_)
+		x_all.extend(dx)
+		x_all.extend(rx)
+		z_all.extend(dz)
+		z_all.extend(rz)
 
 		if rx and ry_ and rz:
 			ax.scatter(rx[0], ry_[0], rz[0], color=color, marker="o", s=25)
@@ -909,6 +1023,35 @@ def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> N
 	ax.set_ylabel("y [m]")
 	ax.set_zlabel("z [m]")
 	ax.legend(loc="best")
+
+	# Widen the perpendicular axis (Y) range so off-plane deviations look smaller.
+	perp_scale = 10.0
+	if y_all:
+		y0 = sum(y_all) / len(y_all)
+		max_dev = max(abs(y - y0) for y in y_all)
+		if max_dev <= 1e-9:
+			max_dev = 0.01
+		ax.set_ylim(y0 - perp_scale * max_dev, y0 + perp_scale * max_dev)
+
+	# In 3D, Matplotlib does not use an equal aspect ratio by default.
+	# Enforce equal scaling on X and Z so planar circles/rectangles don't look squashed.
+	if x_all and z_all:
+		x_min, x_max = min(x_all), max(x_all)
+		z_min, z_max = min(z_all), max(z_all)
+		x_rng = x_max - x_min
+		z_rng = z_max - z_min
+		max_rng = max(x_rng, z_rng, 1e-6)
+		x_c = 0.5 * (x_min + x_max)
+		z_c = 0.5 * (z_min + z_max)
+		ax.set_xlim(x_c - 0.5 * max_rng, x_c + 0.5 * max_rng)
+		ax.set_zlim(z_c - 0.5 * max_rng, z_c + 0.5 * max_rng)
+		try:
+			# Make the Y axis visually shorter (about half) than X/Z,
+			# but not so short that tick labels become unreadable.
+			# This changes only the rendering aspect, not the data limits or tick values.
+			ax.set_box_aspect((1.0, 0.5, 1.0))
+		except Exception:
+			pass
 
 
 def _plot_pose_error_norm_comparison(experiments: Sequence[ExperimentData]) -> None:
@@ -1335,6 +1478,7 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
 	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
+	controller_params = _extract_controller_params(groups)
 
 	title_prefix = csv_path.stem
 	base_title_prefix = title_prefix if base_pose_topic == topic_odom else f"{title_prefix} (mocap)"
@@ -1356,6 +1500,23 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 
 	if real_twist is not None:
 		_plot_real_t960a_twist(real_twist, title_prefix)
+
+	# Show controller parameters (if present) also for single-file runs.
+	_plot_controller_params_table(
+		[
+			ExperimentData(
+				label=title_prefix,
+				csv_path=csv_path,
+				desired_pose=desired_pose,
+				real_pose=real_pose,
+				base_pose_topic=base_pose_topic,
+				odom=odom,
+				accel=accel,
+				gyro=gyro,
+				controller_params=controller_params,
+			)
+		]
+	)
 
 	if save_dir is not None:
 		save_dir.mkdir(parents=True, exist_ok=True)
