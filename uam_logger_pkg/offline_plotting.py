@@ -319,6 +319,7 @@ def _controller_param_order() -> List[str]:
 		"w_kin",
 		"w_mom",
 		"k_err",
+		"k_com",
 	]
 
 
@@ -329,14 +330,18 @@ def _extract_controller_params(groups: Dict[str, List[Dict[str, str]]]) -> Optio
 
 	r = rows[0]
 	raw = (r.get("controller_params_json") or "").strip()
+	# If the row exists but JSON is empty (or "{}"), still return a dict with the
+	# expected keys so the plotting script can show the parameter window.
 	if not raw:
-		return None
+		return {p: None for p in _controller_param_order()}
 	try:
 		obj = json.loads(raw)
 		if isinstance(obj, dict):
+			if len(obj) == 0:
+				return {p: None for p in _controller_param_order()}
 			return obj  # type: ignore[return-value]
 	except Exception:
-		return None
+		return {p: None for p in _controller_param_order()}
 	return None
 
 
