@@ -200,6 +200,8 @@ class UamLoggerNode(Node):
 			"w_kin",
 			"w_mom",
 			"k_err",
+			"k_com",
+			"w_lim",
 		]
 		self._pending_save_t_zero_ns: Optional[int] = None
 

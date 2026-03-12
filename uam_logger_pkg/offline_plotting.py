@@ -318,6 +318,7 @@ def _controller_param_order() -> List[str]:
 		"w_dyn",
 		"w_kin",
 		"w_mom",
+		"w_lim",
 		"k_err",
 		"k_com",
 	]
