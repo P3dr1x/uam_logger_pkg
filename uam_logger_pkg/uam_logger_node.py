@@ -18,7 +18,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import qos_profile_sensor_data
 
 from rcl_interfaces.msg import ParameterType
 from rcl_interfaces.srv import GetParameters
@@ -26,15 +25,6 @@ from rcl_interfaces.srv import GetParameters
 from geometry_msgs.msg import Accel, Pose, PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
-
-
-try:
-	from px4_msgs.msg import SensorCombined  # type: ignore
-
-	HAVE_PX4_MSGS = True
-except Exception:  # pragma: no cover
-	SensorCombined = None  # type: ignore
-	HAVE_PX4_MSGS = False
 
 
 class LoggerState(str, Enum):
@@ -114,7 +104,6 @@ class UamLoggerNode(Node):
 		self.declare_parameter("topic_mocap_pose", "/t960a/pose")
 		self.declare_parameter("topic_ee_pose", "/ee_world_pose")
 		self.declare_parameter("topic_joint_states", "/joint_states")
-		self.declare_parameter("topic_sensor_combined", "/fmu/out/sensor_combined")
 		self.declare_parameter("topic_real_t960a_twist", "/real_t960a_twist")
 
 		self.experiment_name: str = self.get_parameter("experiment_name").value
@@ -138,7 +127,6 @@ class UamLoggerNode(Node):
 		self.topic_mocap_pose: str = self.get_parameter("topic_mocap_pose").value
 		self.topic_ee_pose: str = self.get_parameter("topic_ee_pose").value
 		self.topic_joint_states: str = self.get_parameter("topic_joint_states").value
-		self.topic_sensor_combined: str = self.get_parameter("topic_sensor_combined").value
 		self.topic_real_t960a_twist: str = self.get_parameter("topic_real_t960a_twist").value
 
 		self.state: LoggerState = LoggerState.IDLE
@@ -162,18 +150,6 @@ class UamLoggerNode(Node):
 		self.create_subscription(JointState, self.topic_joint_states, self._joint_states_cb, 10)
 		# Optional real-only topic; if not published, no messages will arrive.
 		self.create_subscription(Twist, self.topic_real_t960a_twist, self._real_t960a_twist_cb, 10)
-
-		if HAVE_PX4_MSGS:
-			self.create_subscription(  # type: ignore[arg-type]
-				SensorCombined,
-				self.topic_sensor_combined,
-				self._sensor_combined_cb,  # type: ignore[arg-type]
-				qos_profile_sensor_data,
-			)
-		else:
-			self.get_logger().warn(
-				"px4_msgs non disponibile: salto la sottoscrizione a /fmu/out/sensor_combined"
-			)
 
 		self._watchdog_timer = self.create_timer(watchdog_period_sec, self._watchdog_tick)
 
@@ -553,53 +529,6 @@ class UamLoggerNode(Node):
 				"position": _join_seq(msg.position),
 				"velocity": _join_seq(msg.velocity),
 				"effort": _join_seq(msg.effort),
-			},
-		)
-
-	def _sensor_combined_cb(self, msg: Any) -> None:
-		if self.state != LoggerState.RECORDING:
-			return
-		t_ns = self._now_ns()
-
-		# Field name can vary across px4_msgs versions; handle defensively.
-		accel = None
-		if hasattr(msg, "accelerometer_m_s2"):
-			accel = getattr(msg, "accelerometer_m_s2")
-		elif hasattr(msg, "accel_m_s2"):
-			accel = getattr(msg, "accel_m_s2")
-
-		gyro = None
-		if hasattr(msg, "gyro_rad"):
-			gyro = getattr(msg, "gyro_rad")
-		elif hasattr(msg, "gyro"):
-			gyro = getattr(msg, "gyro")
-
-		if accel is None:
-			return
-
-		ax = float(accel[0])
-		ay = float(accel[1])
-		az = float(accel[2])
-
-		gx = gy = gz = None
-		if gyro is not None:
-			try:
-				gx = float(gyro[0])
-				gy = float(gyro[1])
-				gz = float(gyro[2])
-			except Exception:
-				gx = gy = gz = None
-
-		self._append(
-			topic=self.topic_sensor_combined,
-			t_ns=t_ns,
-			fields={
-				"ax": ax,
-				"ay": ay,
-				"az": az,
-				"gx": gx,
-				"gy": gy,
-				"gz": gz,
 			},
 		)
 

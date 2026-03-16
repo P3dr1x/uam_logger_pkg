@@ -6,7 +6,6 @@ This script loads the CSV produced by `uam_logger_node` and generates plots for:
 - Drone position and attitude (3x2 grid) (odometry in sim, mocap pose in real)
 - Drone RMS attitude disturbance (RMS of roll/pitch/yaw)
 - Drone displacement norms w.r.t. initial pose
-- PX4 SensorCombined accelerometer + gyroscope data (if present)
 - Real drone twist components from /real_t960a_twist (if present)
 
 The CSV format is the one produced by `UamLoggerNode._save_experiment()`:
@@ -1175,7 +1174,7 @@ def _plot_odometry_displacement_norms_comparison(experiments: Sequence[Experimen
 	fig, axs = plt.subplots(2, 1, sharex=True)
 	fig.suptitle("Drone displacement norms (comparison)")
 
-	for exp in usable:
+	for i, exp in enumerate(usable):
 		odom = exp.odom
 		assert odom is not None
 		x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
@@ -1195,8 +1194,47 @@ def _plot_odometry_displacement_norms_comparison(experiments: Sequence[Experimen
 			)
 			ang_disp_norm_deg.append(_rad_to_deg(math.sqrt(ex * ex + ey * ey + ez * ez)))
 
-		axs[0].plot(odom.t, pos_norm, label=exp.label)
-		axs[1].plot(odom.t, ang_disp_norm_deg, label=exp.label)
+		(line_pos,) = axs[0].plot(odom.t, pos_norm, label=exp.label)
+		(line_ang,) = axs[1].plot(odom.t, ang_disp_norm_deg, label=exp.label)
+
+		pos_mean = sum(pos_norm) / float(len(pos_norm))
+		ang_mean = sum(ang_disp_norm_deg) / float(len(ang_disp_norm_deg))
+		axs[0].axhline(
+			pos_mean,
+			linestyle="--",
+			color=line_pos.get_color(),
+			label="_nolegend_",
+		)
+		axs[1].axhline(
+			ang_mean,
+			linestyle="--",
+			color=line_ang.get_color(),
+			label="_nolegend_",
+		)
+		# Small offset to reduce text overlap across experiments.
+		offset_pts = 4 + 10 * (i % 8)
+		axs[0].annotate(
+			rf"$\\mathbf{{\\overline{{\\|\\Delta p\\|}}={pos_mean:.3f}}}$",
+			x=(0.99, pos_mean),
+			xycoords=axs[0].get_yaxis_transform(),
+			textcoords="offset points",
+			xytext=(0, offset_pts),
+			ha="right",
+			va="bottom",
+			color=line_pos.get_color(),
+			fontweight="bold",
+		)
+		axs[1].annotate(
+			rf"$\\mathbf{{\\overline{{\\|\\Delta \\theta\\|}}={ang_mean:.2f}}}$",
+			x=(0.99, ang_mean),
+			xycoords=axs[1].get_yaxis_transform(),
+			textcoords="offset points",
+			xytext=(0, offset_pts),
+			ha="right",
+			va="bottom",
+			color=line_ang.get_color(),
+			fontweight="bold",
+		)
 
 	for ax in axs:
 		ax.grid(True)
@@ -1257,32 +1295,6 @@ def _plot_odometry_rms_disturbance_comparison(experiments: Sequence[ExperimentDa
 	ax.set_xlabel("t [s]")
 	ax.set_ylabel("RMS [°]")
 	ax.legend(loc="best")
-
-
-def _plot_sensor_combined_accel_comparison(experiments: Sequence[ExperimentData]) -> None:
-	import matplotlib.pyplot as plt
-
-	usable = [e for e in experiments if e.accel is not None and e.accel.t]
-	if not usable:
-		return
-
-	fig, axs = plt.subplots(3, 1, sharex=True)
-	fig.suptitle("SensorCombined accelerometer (comparison)")
-
-	for exp in usable:
-		accel = exp.accel
-		assert accel is not None
-		axs[0].plot(accel.t, accel.ax, label=exp.label)
-		axs[1].plot(accel.t, accel.ay, label=exp.label)
-		axs[2].plot(accel.t, accel.az, label=exp.label)
-
-	axs[0].set_ylabel("ax [m/s^2]")
-	axs[1].set_ylabel("ay [m/s^2]")
-	axs[2].set_ylabel("az [m/s^2]")
-	axs[2].set_xlabel("t [s]")
-	for ax in axs:
-		ax.grid(True)
-		ax.legend(loc="best")
 
 
 def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
@@ -1350,6 +1362,33 @@ def _plot_odometry_displacement_norms(odom: OdomSeries, title_prefix: str) -> No
 
 	ln1 = ax1.plot(odom.t, pos_norm, label="||Δp||", color="tab:blue")
 	ln2 = ax2.plot(odom.t, ang_disp_norm_deg, label="||Δθ||", color="tab:orange")
+
+	pos_mean = sum(pos_norm) / float(len(pos_norm))
+	ang_mean = sum(ang_disp_norm_deg) / float(len(ang_disp_norm_deg))
+	ax1.axhline(pos_mean, linestyle="--", color=ln1[0].get_color(), label="_nolegend_")
+	ax2.axhline(ang_mean, linestyle="--", color=ln2[0].get_color(), label="_nolegend_")
+	ax1.annotate(
+		rf"$\mathbf{{\overline{{\|\Delta p\|}}={pos_mean:.3f}}}$",
+		xy=(0.99, pos_mean),
+		xycoords=ax1.get_yaxis_transform(),
+		textcoords="offset points",
+		xytext=(0, 4),
+		ha="right",
+		va="bottom",
+		color=ln1[0].get_color(),
+		fontweight="bold",
+	)
+	ax2.annotate(
+		rf"$\mathbf{{\overline{{\|\Delta \theta\|}}={ang_mean:.2f}}}$",
+		xy=(0.99, ang_mean),
+		xycoords=ax2.get_yaxis_transform(),
+		textcoords="offset points",
+		xytext=(0, 14),
+		ha="right",
+		va="bottom",
+		color=ln2[0].get_color(),
+		fontweight="bold",
+	)
 
 	ax1.grid(True)
 	ax1.set_title(f"{title_prefix} - Drone displacement norms")
@@ -1426,59 +1465,6 @@ def _plot_odometry_rms_disturbance(odom: OdomSeries, title_prefix: str) -> None:
 	ax.set_title(f"{title_prefix} - $\\delta_{{RMS}}$ disturbance (attitude)")
 	ax.set_xlabel("t [s]")
 	ax.set_ylabel(r"$\delta_{RMS}$ [°]")
-
-
-def _plot_sensor_combined_imu(
-	accel: Optional[AccelSeries],
-	gyro: Optional[GyroSeries],
-	title_prefix: str,
-) -> None:
-	import matplotlib.pyplot as plt
-
-	if accel is None and gyro is None:
-		return
-
-	if accel is not None and gyro is not None:
-		fig, axs = plt.subplots(3, 2, sharex=True)
-		fig.suptitle(f"{title_prefix} - SensorCombined IMU")
-
-		axs[0, 0].plot(accel.t, accel.ax)
-		axs[1, 0].plot(accel.t, accel.ay)
-		axs[2, 0].plot(accel.t, accel.az)
-		axs[0, 0].set_ylabel("ax [m/s^2]")
-		axs[1, 0].set_ylabel("ay [m/s^2]")
-		axs[2, 0].set_ylabel("az [m/s^2]")
-		axs[2, 0].set_xlabel("t [s]")
-		for i in range(3):
-			axs[i, 0].grid(True)
-
-		gx_deg_s = [_rad_to_deg(w) for w in gyro.gx]
-		gy_deg_s = [_rad_to_deg(w) for w in gyro.gy]
-		gz_deg_s = [_rad_to_deg(w) for w in gyro.gz]
-		axs[0, 1].plot(gyro.t, gx_deg_s)
-		axs[1, 1].plot(gyro.t, gy_deg_s)
-		axs[2, 1].plot(gyro.t, gz_deg_s)
-		axs[0, 1].set_ylabel("ωx [°/s]")
-		axs[1, 1].set_ylabel("ωy [°/s]")
-		axs[2, 1].set_ylabel("ωz [°/s]")
-		axs[2, 1].set_xlabel("t [s]")
-		for i in range(3):
-			axs[i, 1].grid(True)
-		return
-
-	# Fallback: keep backward-compatible behavior if only one of the two exists.
-	if accel is not None:
-		fig, axs = plt.subplots(3, 1, sharex=True)
-		fig.suptitle(f"{title_prefix} - SensorCombined accelerometer")
-		axs[0].plot(accel.t, accel.ax)
-		axs[1].plot(accel.t, accel.ay)
-		axs[2].plot(accel.t, accel.az)
-		axs[0].set_ylabel("ax [m/s^2]")
-		axs[1].set_ylabel("ay [m/s^2]")
-		axs[2].set_ylabel("az [m/s^2]")
-		axs[2].set_xlabel("t [s]")
-		for ax in axs:
-			ax.grid(True)
 
 
 def _plot_real_t960a_twist(twist: TwistSeries, title_prefix: str) -> None:
@@ -1563,9 +1549,6 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	if odom_angvel is not None:
 		_plot_odometry_angular_velocity(odom_angvel, title_prefix)
 
-	if accel is not None or gyro is not None:
-		_plot_sensor_combined_imu(accel, gyro, title_prefix)
-
 	if real_twist is not None:
 		_plot_real_t960a_twist(real_twist, title_prefix)
 
@@ -1644,7 +1627,6 @@ def run_comparison(
 	_plot_odometry_comparison(experiments)
 	_plot_odometry_rms_disturbance_comparison(experiments)
 	_plot_odometry_displacement_norms_comparison(experiments)
-	_plot_sensor_combined_accel_comparison(experiments)
 	_plot_controller_params_table(experiments)
 
 	if save_dir is not None:
