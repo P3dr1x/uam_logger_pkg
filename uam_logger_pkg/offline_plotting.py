@@ -304,6 +304,72 @@ def _compute_pose_tracking_errors(
 	return err_t, pos_err_norm, ori_err_norm_deg
 
 
+def _compute_uav_position_displacement_norm(odom: OdomSeries) -> List[float]:
+	"""Compute UAV position displacement norm w.r.t. the first sample.
+
+	This matches the definition of UAV position error used in the decreasing rate:
+	||e_UAV|| = ||p(t) - p(0)||.
+	"""
+	if not odom.t:
+		return []
+	if len(odom.x) == 0:
+		return []
+
+	x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
+	norms: List[float] = []
+	for x, y, z in zip(odom.x, odom.y, odom.z):
+		dx = x - x0
+		dy = y - y0
+		dz = z - z0
+		norms.append(math.sqrt(dx * dx + dy * dy + dz * dz))
+	return norms
+
+
+def _compute_decreasing_rate(
+	desired: PoseSeries,
+	real: PoseSeries,
+	odom: OdomSeries,
+	den_eps: float = 1e-9,
+) -> Tuple[List[float], List[float]]:
+	"""Compute decreasing rate R(t) = ||e_p|| / ||e_UAV||.
+
+	- ||e_p|| is the EE position tracking error norm (desired vs real), computed
+	  on desired timestamps with nearest-neighbor matching on the real EE pose.
+	- ||e_UAV|| is the UAV position displacement norm w.r.t. the initial pose,
+	  sampled at the nearest odometry timestamp to each desired timestamp.
+
+	Returns:
+		R_t: timestamps (seconds), using desired timestamps
+		R: decreasing rate values (dimensionless)
+	"""
+	err_t, pos_err_norm, _ = _compute_pose_tracking_errors(desired, real)
+	if not err_t:
+		return [], []
+	if odom is None or not odom.t:
+		return [], []
+
+	uav_pos_norm = _compute_uav_position_displacement_norm(odom)
+	if not uav_pos_norm:
+		return [], []
+
+	idx = _nearest_indices(odom.t, err_t)
+	if not idx:
+		return [], []
+
+	R_t: List[float] = []
+	R: List[float] = []
+	for k, j in enumerate(idx):
+		if j < 0 or j >= len(uav_pos_norm):
+			continue
+		uav_err = uav_pos_norm[j]
+		if uav_err <= den_eps:
+			continue
+		R_t.append(err_t[k])
+		R.append(pos_err_norm[k] / uav_err)
+
+	return R_t, R
+
+
 def _controller_param_order() -> List[str]:
 	"""Preferred row order for controller param comparison tables."""
 	return [
@@ -807,6 +873,56 @@ def _plot_pose_error_norm(desired: PoseSeries, real: PoseSeries, title_prefix: s
 	axs[1].set_ylabel(r"$\|\|e_R\|\|\;[°]$")
 
 
+def _plot_decreasing_rate(
+	desired: PoseSeries,
+	real: PoseSeries,
+	odom: OdomSeries,
+	title_prefix: str,
+) -> None:
+	"""Plot decreasing rate R(t) = ||e_p|| / ||e_UAV|| versus time."""
+	import matplotlib.pyplot as plt
+
+	R_t, R = _compute_decreasing_rate(desired=desired, real=real, odom=odom)
+	if not R_t:
+		return
+	# Plot starts from 5% of the total trajectory duration.
+	# Keep the mean computed on the full signal (R) as requested.
+	if len(R_t) >= 2:
+		t0 = R_t[0]
+		t1 = R_t[-1]
+		thr = t0 + 0.05 * max(0.0, (t1 - t0))
+		R_t_plot = [t for t in R_t if t >= thr]
+		start_k = len(R_t) - len(R_t_plot)
+		R_plot = R[start_k:]
+		if not R_t_plot:
+			R_t_plot = R_t
+			R_plot = R
+	else:
+		R_t_plot = R_t
+		R_plot = R
+
+	fig, ax = plt.subplots()
+	fig.suptitle(f"{title_prefix} - Decreasing rate")
+
+	(ax_line,) = ax.plot(R_t_plot, R_plot, color="red")
+	R_mean = sum(R) / float(len(R))
+	ax.axhline(R_mean, linestyle="--", color=ax_line.get_color(), label="_nolegend_")
+	ax.annotate(
+		rf"$\mathbf{{\overline{{R}}={R_mean:.3f}}}$",
+		xy=(0.99, R_mean),
+		xycoords=ax.get_yaxis_transform(),
+		textcoords="offset points",
+		xytext=(0, 4),
+		ha="right",
+		va="bottom",
+		color=ax_line.get_color(),
+		fontweight="bold",
+	)
+	ax.grid(True)
+	ax.set_xlabel("t [s] (desired timestamps)")
+	ax.set_ylabel(r"$R=\|\|e_p\|\|/\|\|e_{UAV}\|\|$")
+
+
 def _plot_ee_trajectories_comparison(experiments: Sequence[ExperimentData]) -> None:
 	"""Plot desired vs real EE trajectory for multiple experiments.
 
@@ -1119,6 +1235,69 @@ def _plot_pose_error_norm_comparison(experiments: Sequence[ExperimentData]) -> N
 	axs[1].set_ylabel(r"$\|\|e_R\|\|\;[°]$")
 
 
+def _plot_decreasing_rate_comparison(experiments: Sequence[ExperimentData]) -> None:
+	"""Overlay decreasing rate R(t) across experiments."""
+	import matplotlib.pyplot as plt
+
+	usable = [
+		e
+		for e in experiments
+		if e.desired_pose is not None and e.real_pose is not None and e.odom is not None
+	]
+	if not usable:
+		return
+
+	fig, ax = plt.subplots()
+	fig.suptitle("Decreasing rate (comparison)")
+
+	for i, exp in enumerate(usable):
+		desired = exp.desired_pose
+		real = exp.real_pose
+		odom = exp.odom
+		assert desired is not None
+		assert real is not None
+		assert odom is not None
+
+		R_t, R = _compute_decreasing_rate(desired=desired, real=real, odom=odom)
+		if not R_t:
+			continue
+		# Plot starts from 5% of the total trajectory duration (per-experiment).
+		# Keep the mean computed on the full signal (R).
+		if len(R_t) >= 2:
+			t0 = R_t[0]
+			t1 = R_t[-1]
+			thr = t0 + 0.05 * max(0.0, (t1 - t0))
+			R_t_plot = [t for t in R_t if t >= thr]
+			start_k = len(R_t) - len(R_t_plot)
+			R_plot = R[start_k:]
+			if not R_t_plot:
+				R_t_plot = R_t
+				R_plot = R
+		else:
+			R_t_plot = R_t
+			R_plot = R
+
+		(line_r,) = ax.plot(R_t_plot, R_plot, label=exp.label)
+		R_mean = sum(R) / float(len(R))
+		ax.axhline(R_mean, linestyle="--", color=line_r.get_color(), label="_nolegend_")
+		ax.annotate(
+			rf"$\mathbf{{\overline{{R}}={R_mean:.3f}}}$",
+			xy=(0.99, R_mean),
+			xycoords=ax.get_yaxis_transform(),
+			textcoords="offset points",
+			xytext=(0, 4 + 10 * (i % 8)),
+			ha="right",
+			va="bottom",
+			color=line_r.get_color(),
+			fontweight="bold",
+		)
+
+	ax.grid(True)
+	ax.legend(loc="best")
+	ax.set_xlabel("t [s] (desired timestamps)")
+	ax.set_ylabel(r"$R=\|\|e_p\|\|/\|\|e_{UAV}\|\|$")
+
+
 def _plot_odometry_comparison(experiments: Sequence[ExperimentData]) -> None:
 	import matplotlib.pyplot as plt
 
@@ -1214,8 +1393,8 @@ def _plot_odometry_displacement_norms_comparison(experiments: Sequence[Experimen
 		# Small offset to reduce text overlap across experiments.
 		offset_pts = 4 + 10 * (i % 8)
 		axs[0].annotate(
-			rf"$\\mathbf{{\\overline{{\\|\\Delta p\\|}}={pos_mean:.3f}}}$",
-			x=(0.99, pos_mean),
+			rf"$\mathbf{{\overline{{\|\Delta p\|}}={pos_mean:.3f}}}$",
+			xy=(0.99, pos_mean),
 			xycoords=axs[0].get_yaxis_transform(),
 			textcoords="offset points",
 			xytext=(0, offset_pts),
@@ -1225,8 +1404,8 @@ def _plot_odometry_displacement_norms_comparison(experiments: Sequence[Experimen
 			fontweight="bold",
 		)
 		axs[1].annotate(
-			rf"$\\mathbf{{\\overline{{\\|\\Delta \\theta\\|}}={ang_mean:.2f}}}$",
-			x=(0.99, ang_mean),
+			rf"$\mathbf{{\overline{{\|\Delta \theta\|}}={ang_mean:.2f}}}$",
+			xy=(0.99, ang_mean),
 			xycoords=axs[1].get_yaxis_transform(),
 			textcoords="offset points",
 			xytext=(0, offset_pts),
@@ -1540,6 +1719,8 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	if desired_pose is not None and real_pose is not None:
 		_plot_ee_trajectories(desired_pose, real_pose, title_prefix)
 		_plot_pose_error_norm(desired_pose, real_pose, title_prefix)
+		if odom is not None:
+			_plot_decreasing_rate(desired_pose, real_pose, odom, title_prefix)
 
 	if odom is not None:
 		_plot_odometry(odom, base_title_prefix)
@@ -1624,6 +1805,7 @@ def run_comparison(
 
 	_plot_ee_trajectories_comparison(experiments)
 	_plot_pose_error_norm_comparison(experiments)
+	_plot_decreasing_rate_comparison(experiments)
 	_plot_odometry_comparison(experiments)
 	_plot_odometry_rms_disturbance_comparison(experiments)
 	_plot_odometry_displacement_norms_comparison(experiments)
