@@ -110,6 +110,9 @@ class ExperimentData:
 	accel: Optional[AccelSeries]
 	gyro: Optional[GyroSeries]
 
+	# Real drone twist components from /real_t960a_twist (if present).
+	real_twist: Optional[TwistSeries]
+
 	# Controller parameters (metadata) if available in the CSV.
 	controller_params: Optional[Dict[str, object]]
 
@@ -503,6 +506,7 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 	topic_odom = "/model/t960a_0/odometry"
 	topic_mocap_pose = "/t960a/pose"
 	topic_sensor = "/fmu/out/sensor_combined"
+	topic_real_twist = "/real_t960a_twist"
 
 	desired_pose = _extract_pose_series(groups.get(topic_desired_pose, []))
 	real_pose = _extract_pose_series(groups.get(topic_real_pose, []))
@@ -512,6 +516,7 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
+	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
 	controller_params = _extract_controller_params(groups)
 
 	return ExperimentData(
@@ -523,8 +528,50 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 		odom=odom,
 		accel=accel,
 		gyro=gyro,
+		real_twist=real_twist,
 		controller_params=controller_params,
 	)
+
+
+def _plot_real_t960a_twist_comparison(experiments: Sequence[ExperimentData]) -> None:
+	"""Overlay /real_t960a_twist components across experiments."""
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.real_twist is not None and e.real_twist.t]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(3, 2, sharex=True)
+	fig.suptitle("Real drone twist (/real_t960a_twist) - comparison")
+
+	for exp in usable:
+		twist = exp.real_twist
+		assert twist is not None
+
+		wx_deg_s = [_rad_to_deg(w) for w in twist.wx]
+		wy_deg_s = [_rad_to_deg(w) for w in twist.wy]
+		wz_deg_s = [_rad_to_deg(w) for w in twist.wz]
+
+		axs[0, 0].plot(twist.t, twist.vx, label=exp.label)
+		axs[1, 0].plot(twist.t, twist.vy, label=exp.label)
+		axs[2, 0].plot(twist.t, twist.vz, label=exp.label)
+		axs[0, 1].plot(twist.t, wx_deg_s, label=exp.label)
+		axs[1, 1].plot(twist.t, wy_deg_s, label=exp.label)
+		axs[2, 1].plot(twist.t, wz_deg_s, label=exp.label)
+
+	axs[0, 0].set_ylabel("vx [m/s]")
+	axs[1, 0].set_ylabel("vy [m/s]")
+	axs[2, 0].set_ylabel("vz [m/s]")
+	axs[2, 0].set_xlabel("t [s]")
+	axs[0, 1].set_ylabel("ωx [°/s]")
+	axs[1, 1].set_ylabel("ωy [°/s]")
+	axs[2, 1].set_ylabel("ωz [°/s]")
+	axs[2, 1].set_xlabel("t [s]")
+
+	for i in range(3):
+		for j in range(2):
+			axs[i, j].grid(True)
+			axs[i, j].legend(loc="best")
 
 
 def _load_csv_grouped(csv_path: Path) -> Dict[str, List[Dict[str, str]]]:
@@ -1745,6 +1792,7 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 				odom=odom,
 				accel=accel,
 				gyro=gyro,
+				real_twist=real_twist,
 				controller_params=controller_params,
 			)
 		]
@@ -1809,6 +1857,7 @@ def run_comparison(
 	_plot_odometry_comparison(experiments)
 	_plot_odometry_rms_disturbance_comparison(experiments)
 	_plot_odometry_displacement_norms_comparison(experiments)
+	_plot_real_t960a_twist_comparison(experiments)
 	_plot_controller_params_table(experiments)
 
 	if save_dir is not None:
