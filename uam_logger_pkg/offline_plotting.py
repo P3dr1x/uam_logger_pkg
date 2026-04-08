@@ -3,9 +3,9 @@
 This script loads the CSV produced by `uam_logger_node` and generates plots for:
 - Desired vs real end-effector 3D trajectory
 - Pose tracking error norm over time (nearest-timestamp matching)
-- Drone position and attitude (3x2 grid) (odometry in sim, mocap pose in real)
 - Drone RMS attitude disturbance (RMS of roll/pitch/yaw)
 - Drone displacement norms w.r.t. initial pose
+- Arm joint trajectories (shoulder, elbow, wrist_angle) from /joint_states (if present)
 - Real drone twist components from /real_t960a_twist (if present)
 
 The CSV format is the one produced by `UamLoggerNode._save_experiment()`:
@@ -113,8 +113,21 @@ class ExperimentData:
 	# Real drone twist components from /real_t960a_twist (if present).
 	real_twist: Optional[TwistSeries]
 
+	# Arm joints from /joint_states (if present).
+	arm_joints: Optional["ArmJointSeries"]
+
 	# Controller parameters (metadata) if available in the CSV.
 	controller_params: Optional[Dict[str, object]]
+
+
+@dataclass(frozen=True)
+class ArmJointSeries:
+	"""Time series for selected arm joints (from sensor_msgs/JointState)."""
+
+	t: List[float]
+	shoulder: List[float]
+	elbow: List[float]
+	wrist_angle: List[float]
 
 
 def _clamp(x: float, lo: float, hi: float) -> float:
@@ -264,6 +277,69 @@ def _nearest_indices(t_ref: List[float], t_query: List[float]) -> List[int]:
 	return indices
 
 
+def _find_joint_states_topic(groups: Dict[str, List[Dict[str, str]]]) -> Optional[str]:
+	"""Heuristically find the JointState topic name in the CSV groups."""
+	if "/joint_states" in groups:
+		return "/joint_states"
+	for k in groups.keys():
+		if "joint_states" in k:
+			return k
+	return None
+
+
+def _extract_arm_joint_series(rows: List[Dict[str, str]]) -> Optional[ArmJointSeries]:
+	"""Extract shoulder, elbow, wrist_angle joint trajectories.
+
+	CSV rows are expected to contain `name` and `position` fields as semicolon-separated
+	lists (as produced by uam_logger_node).
+	"""
+	if not rows:
+		return None
+
+	t: List[float] = []
+	shoulder: List[float] = []
+	elbow: List[float] = []
+	wrist_angle: List[float] = []
+
+	for r in rows:
+		name_s = (r.get("name") or "").strip()
+		pos_s = (r.get("position") or "").strip()
+		if not name_s or not pos_s:
+			continue
+
+		try:
+			t_k = float(r["t"])
+		except Exception:
+			continue
+
+		names = [n.strip() for n in name_s.split(";") if n.strip()]
+		pos_strs = [p.strip() for p in pos_s.split(";") if p.strip()]
+		if len(names) != len(pos_strs) or not names:
+			continue
+
+		try:
+			positions = [float(p) for p in pos_strs]
+		except Exception:
+			continue
+
+		pos_map = dict(zip(names, positions))
+		if (
+			"shoulder" not in pos_map
+			or "elbow" not in pos_map
+			or "wrist_angle" not in pos_map
+		):
+			continue
+
+		t.append(t_k)
+		shoulder.append(pos_map["shoulder"])
+		elbow.append(pos_map["elbow"])
+		wrist_angle.append(pos_map["wrist_angle"])
+
+	if not t:
+		return None
+	return ArmJointSeries(t=t, shoulder=shoulder, elbow=elbow, wrist_angle=wrist_angle)
+
+
 def _compute_pose_tracking_errors(
 	desired: PoseSeries, real: PoseSeries
 ) -> Tuple[List[float], List[float], List[float]]:
@@ -326,6 +402,38 @@ def _compute_uav_position_displacement_norm(odom: OdomSeries) -> List[float]:
 		dz = z - z0
 		norms.append(math.sqrt(dx * dx + dy * dy + dz * dz))
 	return norms
+
+
+def _compute_uav_rotational_displacement_norm_deg(odom: OdomSeries) -> List[float]:
+	"""Compute UAV attitude displacement norm (deg) w.r.t. the first sample.
+
+	The attitude displacement is computed as the norm of the SO(3) log-map error
+	vector between the initial attitude and the current one.
+
+	This matches the rotational displacement shown in
+	`_plot_odometry_displacement_norms_comparison`.
+	"""
+	if not odom.t:
+		return []
+	if len(odom.roll) == 0 or len(odom.pitch) == 0 or len(odom.yaw) == 0:
+		return []
+
+	q0x, q0y, q0z, q0w = _rpy_to_quat(odom.roll[0], odom.pitch[0], odom.yaw[0])
+	ang_disp_norm_deg: List[float] = []
+	for roll, pitch, yaw in zip(odom.roll, odom.pitch, odom.yaw):
+		qkx, qky, qkz, qkw = _rpy_to_quat(roll, pitch, yaw)
+		ex, ey, ez = _relative_rotation_axis_angle_vec(
+			q0x,
+			q0y,
+			q0z,
+			q0w,
+			qkx,
+			qky,
+			qkz,
+			qkw,
+		)
+		ang_disp_norm_deg.append(_rad_to_deg(math.sqrt(ex * ex + ey * ey + ez * ez)))
+	return ang_disp_norm_deg
 
 
 def _compute_decreasing_rate(
@@ -517,6 +625,9 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
 	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
+
+	joint_topic = _find_joint_states_topic(groups)
+	arm_joints = _extract_arm_joint_series(groups.get(joint_topic, [])) if joint_topic else None
 	controller_params = _extract_controller_params(groups)
 
 	return ExperimentData(
@@ -529,8 +640,58 @@ def _load_experiment(csv_path: Path, label: str) -> ExperimentData:
 		accel=accel,
 		gyro=gyro,
 		real_twist=real_twist,
+		arm_joints=arm_joints,
 		controller_params=controller_params,
 	)
+
+
+def _plot_arm_joint_trajectories(joints: ArmJointSeries, title_prefix: str) -> None:
+	import matplotlib.pyplot as plt
+
+	if not joints.t:
+		return
+
+	fig, axs = plt.subplots(3, 1, sharex=True)
+	fig.suptitle(f"{title_prefix} - Arm joint trajectories")
+
+	axs[0].plot(joints.t, joints.shoulder, color="red")
+	axs[1].plot(joints.t, joints.elbow, color=(31 / 255, 230 / 255, 51 / 255))
+	axs[2].plot(joints.t, joints.wrist_angle, color="blue")
+
+	axs[0].set_ylabel("shoulder [rad]")
+	axs[1].set_ylabel("elbow [rad]")
+	axs[2].set_ylabel("wrist_angle [rad]")
+	axs[2].set_xlabel("t [s]")
+
+	for ax in axs:
+		ax.grid(True)
+
+
+def _plot_arm_joint_trajectories_comparison(experiments: Sequence[ExperimentData]) -> None:
+	import matplotlib.pyplot as plt
+
+	usable = [e for e in experiments if e.arm_joints is not None and e.arm_joints.t]
+	if not usable:
+		return
+
+	fig, axs = plt.subplots(3, 1, sharex=True)
+	fig.suptitle("Arm joint trajectories (comparison)")
+
+	for exp in usable:
+		j = exp.arm_joints
+		assert j is not None
+		axs[0].plot(j.t, j.shoulder, label=exp.label)
+		axs[1].plot(j.t, j.elbow, label=exp.label)
+		axs[2].plot(j.t, j.wrist_angle, label=exp.label)
+
+	axs[0].set_ylabel("shoulder [rad]")
+	axs[1].set_ylabel("elbow [rad]")
+	axs[2].set_ylabel("wrist_angle [rad]")
+	axs[2].set_xlabel("t [s]")
+
+	for ax in axs:
+		ax.grid(True)
+		ax.legend(loc="best")
 
 
 def _plot_real_t960a_twist_comparison(experiments: Sequence[ExperimentData]) -> None:
@@ -1345,51 +1506,6 @@ def _plot_decreasing_rate_comparison(experiments: Sequence[ExperimentData]) -> N
 	ax.set_ylabel(r"$R=\|\|e_p\|\|/\|\|e_{UAV}\|\|$")
 
 
-def _plot_odometry_comparison(experiments: Sequence[ExperimentData]) -> None:
-	import matplotlib.pyplot as plt
-
-	usable = [e for e in experiments if e.odom is not None]
-	if not usable:
-		return
-
-	fig, axs = plt.subplots(3, 2, sharex=True)
-	fig.suptitle("Drone odometry (comparison, deviations from initial)")
-
-	for exp in usable:
-		odom = exp.odom
-		assert odom is not None
-		x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
-		r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
-
-		dx = [x - x0 for x in odom.x]
-		dy = [y - y0 for y in odom.y]
-		dz = [z - z0 for z in odom.z]
-		droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
-		dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
-		dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
-
-		axs[0, 0].plot(odom.t, dx, label=exp.label)
-		axs[1, 0].plot(odom.t, dy, label=exp.label)
-		axs[2, 0].plot(odom.t, dz, label=exp.label)
-		axs[0, 1].plot(odom.t, droll, label=exp.label)
-		axs[1, 1].plot(odom.t, dpitch, label=exp.label)
-		axs[2, 1].plot(odom.t, dyaw, label=exp.label)
-
-	axs[0, 0].set_ylabel("Δx [m]")
-	axs[1, 0].set_ylabel("Δy [m]")
-	axs[2, 0].set_ylabel("Δz [m]")
-	axs[2, 0].set_xlabel("t [s]")
-	axs[0, 1].set_ylabel("Δroll [°]")
-	axs[1, 1].set_ylabel("Δpitch [°]")
-	axs[2, 1].set_ylabel("Δyaw [°]")
-	axs[2, 1].set_xlabel("t [s]")
-
-	for i in range(3):
-		for j in range(2):
-			axs[i, j].grid(True)
-			axs[i, j].legend(loc="best")
-
-
 def _plot_odometry_displacement_norms_comparison(experiments: Sequence[ExperimentData]) -> None:
 	import matplotlib.pyplot as plt
 
@@ -1521,45 +1637,6 @@ def _plot_odometry_rms_disturbance_comparison(experiments: Sequence[ExperimentDa
 	ax.set_xlabel("t [s]")
 	ax.set_ylabel("RMS [°]")
 	ax.legend(loc="best")
-
-
-def _plot_odometry(odom: OdomSeries, title_prefix: str) -> None:
-	import matplotlib.pyplot as plt
-
-	# Plot deviations from initial values
-	x0, y0, z0 = odom.x[0], odom.y[0], odom.z[0]
-	r0, p0, yw0 = odom.roll[0], odom.pitch[0], odom.yaw[0]
-
-	dx = [x - x0 for x in odom.x]
-	dy = [y - y0 for y in odom.y]
-	dz = [z - z0 for z in odom.z]
-
-	droll = [_rad_to_deg(_wrap_to_pi(r - r0)) for r in odom.roll]
-	dpitch = [_rad_to_deg(_wrap_to_pi(p - p0)) for p in odom.pitch]
-	dyaw = [_rad_to_deg(_wrap_to_pi(yw - yw0)) for yw in odom.yaw]
-
-	fig, axs = plt.subplots(3, 2, sharex=True)
-	fig.suptitle(f"{title_prefix} - Drone odometry")
-
-	axs[0, 0].plot(odom.t, dx, color="red")
-	axs[1, 0].plot(odom.t, dy, color=(31 / 255, 230 / 255, 51 / 255))
-	axs[2, 0].plot(odom.t, dz, color="blue")
-	axs[0, 0].set_ylabel("Δx [m]")
-	axs[1, 0].set_ylabel("Δy [m]")
-	axs[2, 0].set_ylabel("Δz [m]")
-	axs[2, 0].set_xlabel("t [s]")
-	for i in range(3):
-		axs[i, 0].grid(True)
-
-	axs[0, 1].plot(odom.t, droll, color="red")
-	axs[1, 1].plot(odom.t, dpitch, color=(31 / 255, 230 / 255, 51 / 255))
-	axs[2, 1].plot(odom.t, dyaw, color="blue")
-	axs[0, 1].set_ylabel("Δroll [°]")
-	axs[1, 1].set_ylabel("Δpitch [°]")
-	axs[2, 1].set_ylabel("Δyaw [°]")
-	axs[2, 1].set_xlabel("t [s]")
-	for i in range(3):
-		axs[i, 1].grid(True)
 
 
 def _plot_odometry_displacement_norms(odom: OdomSeries, title_prefix: str) -> None:
@@ -1746,6 +1823,7 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	topic_mocap_pose = "/t960a/pose"
 	topic_sensor = "/fmu/out/sensor_combined"
 	topic_real_twist = "/real_t960a_twist"
+	topic_joint_states = "/joint_states"
 
 	desired_pose = _extract_pose_series(groups.get(topic_desired_pose, []))
 	real_pose = _extract_pose_series(groups.get(topic_real_pose, []))
@@ -1758,6 +1836,10 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 	accel = _extract_accel_series(groups.get(topic_sensor, []))
 	gyro = _extract_gyro_series(groups.get(topic_sensor, []))
 	real_twist = _extract_twist_series(groups.get(topic_real_twist, []))
+
+	# JointState topic name might differ depending on logger configuration.
+	joint_topic = topic_joint_states if topic_joint_states in groups else _find_joint_states_topic(groups)
+	arm_joints = _extract_arm_joint_series(groups.get(joint_topic, [])) if joint_topic else None
 	controller_params = _extract_controller_params(groups)
 
 	title_prefix = csv_path.stem
@@ -1770,12 +1852,14 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 			_plot_decreasing_rate(desired_pose, real_pose, odom, title_prefix)
 
 	if odom is not None:
-		_plot_odometry(odom, base_title_prefix)
 		_plot_odometry_rms_disturbance(odom, base_title_prefix)
 		_plot_odometry_displacement_norms(odom, base_title_prefix)
 
 	if odom_angvel is not None:
 		_plot_odometry_angular_velocity(odom_angvel, title_prefix)
+
+	if arm_joints is not None:
+		_plot_arm_joint_trajectories(arm_joints, title_prefix)
 
 	if real_twist is not None:
 		_plot_real_t960a_twist(real_twist, title_prefix)
@@ -1793,6 +1877,7 @@ def run(csv_path: Path, show: bool, save_dir: Optional[Path]) -> None:
 				accel=accel,
 				gyro=gyro,
 				real_twist=real_twist,
+				arm_joints=arm_joints,
 				controller_params=controller_params,
 			)
 		]
@@ -1854,9 +1939,9 @@ def run_comparison(
 	_plot_ee_trajectories_comparison(experiments)
 	_plot_pose_error_norm_comparison(experiments)
 	_plot_decreasing_rate_comparison(experiments)
-	_plot_odometry_comparison(experiments)
 	_plot_odometry_rms_disturbance_comparison(experiments)
 	_plot_odometry_displacement_norms_comparison(experiments)
+	_plot_arm_joint_trajectories_comparison(experiments)
 	_plot_real_t960a_twist_comparison(experiments)
 	_plot_controller_params_table(experiments)
 
