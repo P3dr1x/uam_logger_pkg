@@ -27,6 +27,7 @@ setup(
 			"uam_logger_node = uam_logger_pkg.uam_logger_node:main",
 			"uam_logger_offline_plot = uam_logger_pkg.offline_plotting:main",
 			"uam_logger_animated_plot = uam_logger_pkg.animated_plot:main",
+			"bar_chart_plotting = uam_logger_pkg.bar_chart_plotting:main",
 		],
 	},
 )

@@ -110,10 +110,6 @@ Topic remapping via parameters (advanced):
 
 ## Offline plotting
 
-Example output (odometry):
-
-![Example odometry plot](resource/plot_odom.png)
-
 You can generate plots from a saved CSV using:
 
 ```bash
@@ -144,3 +140,29 @@ ros2 run uam_logger_pkg uam_logger_offline_plot -- \
   --no-show  
   --print-params-markdown
 ```
+
+## Mean ± SD bar charts (multiple runs)
+
+To compare the *average* behavior of multiple runs grouped by controller family
+(e.g., Jpinv vs QP), you can use:
+
+```bash
+ros2 run uam_logger_pkg bar_chart_plotting -- \
+  --family Jpinv ~/.ros/uam_logger/run1.csv ~/.ros/uam_logger/run2.csv ~/.ros/uam_logger/run3.csv \
+  --family QP    ~/.ros/uam_logger/run4.csv ~/.ros/uam_logger/run5.csv \
+  --save-dir ~/.ros/uam_logger/plots
+```
+
+The script computes, for each run, the time-mean of:
+
+- end-effector position error norm $\overline{\|e_p\|}$
+- UAV translational displacement norm $\overline{\|\Delta p\|}$
+- UAV rotational displacement norm $\overline{\|\Delta\theta\|}$
+
+Then it plots mean ± SD across runs for each family.
+
+Notes on SD bars:
+
+- The SD shown as error bars represents the **temporal standard deviation** of the
+  metric signal around its own mean (within-run variability), aggregated across
+  runs in the same family with a pooled estimate.
